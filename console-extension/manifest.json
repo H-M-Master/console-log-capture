@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Console 实时日志采集",
+  "version": "1.0.0",
+  "description": "捕获指定标签页的 Console 日志，实时展示在侧边栏并落盘到本地文件",
+  "permissions": ["scripting", "tabs", "sidePanel"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": {}
+}

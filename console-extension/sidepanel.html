@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Console 实时日志采集</title>
+<style>
+  body {
+    font-family: -apple-system, "Microsoft YaHei", sans-serif;
+    margin: 0;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    box-sizing: border-box;
+  }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  #tabInfo { font-size: 12px; color: #555; margin-bottom: 10px; word-break: break-all; }
+  .buttons { margin-bottom: 8px; }
+  button {
+    padding: 6px 12px;
+    font-size: 13px;
+    margin-right: 6px;
+    margin-bottom: 6px;
+    cursor: pointer;
+  }
+  button:disabled { cursor: not-allowed; opacity: 0.5; }
+  #status {
+    font-size: 12px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: #f0f0f0;
+    margin-bottom: 8px;
+    white-space: pre-wrap;
+  }
+  #status.running { background: #e3f5e1; color: #1e7d1e; }
+  #status.stopped { background: #f0f0f0; color: #555; }
+  #status.error { background: #fdecea; color: #c62828; }
+  #dirRow {
+    font-size: 12px;
+    color: #555;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  #dirLabel { word-break: break-all; }
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  #searchInput {
+    flex: 1;
+    min-width: 120px;
+    padding: 5px 8px;
+    font-size: 12px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+  }
+  .mergeToggleLabel {
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  #logWrapper {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+  }
+  #logView {
+    height: 100%;
+    overflow-y: auto;
+    background: #1e1e1e;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12px;
+    padding: 8px;
+    border-radius: 4px;
+    box-sizing: border-box;
+  }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-errors { color: #f14c4c; }
+  .log-warnings { color: #cca700; }
+  .log-info { color: #d4d4d4; }
+  .log-verbose { color: #858585; }
+  #jumpBottomBtn {
+    display: none;
+    position: absolute;
+    bottom: 10px;
+    right: 16px;
+    font-size: 11px;
+    padding: 3px 8px;
+    opacity: 0.9;
+  }
+  #lineCount { font-size: 11px; color: #888; margin-top: 6px; }
+  #filterDropdown {
+    position: relative;
+    display: inline-block;
+    font-size: 12px;
+  }
+  #filterDropdown summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 5px 10px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fafafa;
+    user-select: none;
+  }
+  #filterDropdown summary::-webkit-details-marker { display: none; }
+  #filterDropdown summary::after { content: " \25BE"; }
+  .filter-menu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 10;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+    padding: 6px 0;
+    min-width: 140px;
+  }
+  .filter-menu label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .filter-menu label:hover { background: #f0f0f0; }
+  .filter-menu hr { border: none; border-top: 1px solid #eee; margin: 4px 0; }
+  #statsBar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .statChip {
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 10px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    user-select: none;
+  }
+  .statChip:hover { border-color: currentColor; }
+  .statChip.errors { background: #fdecea; color: #c62828; }
+  .statChip.warnings { background: #fff8e1; color: #8a6d00; }
+  .statChip.info { background: #eef2f3; color: #444; }
+  .statChip.verbose { background: #f0f0f0; color: #777; }
+  .errorNav {
+    display: flex;
+    gap: 6px;
+    margin-left: auto;
+  }
+  .errorNav button { padding: 3px 8px; font-size: 11px; margin: 0; }
+</style>
+</head>
+<body>
+  <h1>Console 实时日志采集</h1>
+  <div id="tabInfo">尚未选择标签页</div>
+  <div class="buttons">
+    <button id="startBtn">开始</button>
+    <button id="stopBtn" disabled>停止</button>
+    <button id="clearBtn">清空视图</button>
+  </div>
+  <div id="dirRow">
+    <span id="dirLabel">保存目录：未设置</span>
+    <button id="changeDirBtn">更换目录</button>
+  </div>
+  <div id="statsBar">
+    <span class="statChip errors" id="chipErrors" data-level="errors">Errors: 0</span>
+    <span class="statChip warnings" id="chipWarnings" data-level="warnings">Warnings: 0</span>
+    <span class="statChip info" id="chipInfo" data-level="info">Info: 0</span>
+    <span class="statChip verbose" id="chipVerbose" data-level="verbose">Verbose: 0</span>
+    <div class="errorNav">
+      <button id="prevErrorBtn" disabled>◀ 上一个错误</button>
+      <button id="nextErrorBtn" disabled>下一个错误 ▶</button>
+    </div>
+  </div>
+  <div class="toolbar">
+    <details id="filterDropdown">
+      <summary id="filterSummary">全部级别</summary>
+      <div class="filter-menu">
+        <label><input type="checkbox" data-level="verbose" checked> Verbose</label>
+        <label><input type="checkbox" data-level="info" checked> Info</label>
+        <label><input type="checkbox" data-level="warnings" checked> Warnings</label>
+        <label><input type="checkbox" data-level="errors" checked> Errors</label>
+        <hr>
+        <label><input type="checkbox" id="filterAll" checked> 全选/全不选</label>
+      </div>
+    </details>
+    <input type="text" id="searchInput" placeholder="搜索关键字...">
+    <label class="mergeToggleLabel"><input type="checkbox" id="mergeToggle"> 合并重复日志</label>
+  </div>
+  <div id="status" class="stopped">未开始</div>
+  <div id="logWrapper">
+    <div id="logView"></div>
+    <button id="jumpBottomBtn">↓ 回到底部</button>
+  </div>
+  <div id="lineCount">已记录 0 条</div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
