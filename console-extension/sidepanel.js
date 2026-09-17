@@ -21,6 +21,7 @@ const statChips = {
 };
 const prevErrorBtn = document.getElementById('prevErrorBtn');
 const nextErrorBtn = document.getElementById('nextErrorBtn');
+const diagBtn = document.getElementById('diagBtn');
 
 // 视图里保留的最大行数。这个数字直接决定了侧边栏占多少内存和 DOM 节点数，
 // 不要调太大：每多一行就多一个常驻 DOM 节点，浏览器长时间运行会明显变卡。
@@ -62,6 +63,12 @@ let errorSummaryTruncated = false;
 let categoryCounts = { verbose: 0, info: 0, warnings: 0, errors: 0 };
 // 错误汇总内容（有上限，供停止时写汇总文件用）
 let errorSummaryLines = [];
+// 速率统计：每秒更新一次
+let rateWindowCount = 0;
+let rateTimer = null;
+let currentRate = 0;
+// 自测结果的落点：由 runtime.onMessage 收到后调用
+let measureResolve = () => {};
 // 当前视图里的行：只保留最近 MAX_DISPLAY_ROWS 条
 let displayRows = [];
 // 每一行都带一个只增不减的 seq。用它来标记「视图已经渲染到哪一行了」，
@@ -158,10 +165,30 @@ function rowText(row) {
 
 function updateLineCount() {
   const parts = [`共 ${totalCount} 条`];
+  if (running) parts.push(`速率 ${currentRate} 条/秒`);
   if (droppedCount > 0) parts.push(`因上限丢弃 ${droppedCount} 条`);
   parts.push(`视图保留 ${displayRows.length} 行`);
   if (mergeToggle.checked) parts.push('已合并重复');
   lineCountEl.textContent = parts.join('，');
+}
+
+// 每秒算一次日志速率，用来判断是不是真有高频刷屏
+function startRateTimer() {
+  stopRateTimer();
+  rateWindowCount = 0;
+  currentRate = 0;
+  rateTimer = setInterval(() => {
+    currentRate = rateWindowCount;
+    rateWindowCount = 0;
+    updateLineCount();
+  }, 1000);
+}
+
+function stopRateTimer() {
+  if (rateTimer) {
+    clearInterval(rateTimer);
+    rateTimer = null;
+  }
 }
 
 function scrollToBottomIfNeeded() {
@@ -314,77 +341,93 @@ function mainWorldCapture() {
   }
   window.__ccInstalled = true;
   window.__ccRunning = true;
-  window.__ccBuffer = [];
 
   const MAX_BUFFER = 2000; // 缓冲区上限，超出丢最旧的，防止后台节流时无限膨胀
+  const MAX_BATCH = 500; // 单次搬运上限：即使缓冲里堆满了，也不一次搬运整批
   const MAX_TEXT = 2000; // 单条文本上限，防止一条巨型日志把内存顶爆
   const FLUSH_MS = 300;
 
-  // 不做深递归序列化：页面对象（如 Cocos 的 Node）常有循环引用，
-  // JSON.stringify 会先遍历整棵对象图才抛错，代价全部落在页面主线程上。
-  function stringifyArg(a) {
+  // 环形缓冲：不做 splice 搬移，写入位置循环前进。
+  // 顺序在 flush 时还原，代价只有一次 slice。
+  const ring = new Array(MAX_BUFFER);
+  let ringLen = 0;
+  let ringHead = 0;
+
+  function ringPush(item) {
+    ring[ringHead] = item;
+    ringHead = (ringHead + 1) % MAX_BUFFER;
+    if (ringLen < MAX_BUFFER) ringLen++;
+  }
+
+  // 取当前缓冲里最旧的 limit 条（保持从旧到新的顺序）
+  function ringDrain(limit) {
+    if (ringLen === 0) return null;
+    const take = limit < ringLen ? limit : ringLen;
+    const oldestIdx = (ringHead - ringLen + MAX_BUFFER) % MAX_BUFFER; // 最旧那条的下标
+    const out = new Array(take);
+    for (let i = 0; i < take; i++) out[i] = ring[(oldestIdx + i) % MAX_BUFFER];
+    ringLen -= take;
+    return out;
+  }
+
+  // 只描述参数的类型/形状，绝不读取对象的属性值。
+  // 读取属性会触发 getter，而 Cocos 引擎对象的属性常带惰性计算——
+  // 那等于逼着引擎在主线程上做本不该发生的运算（曾导致 Cocos 进程 CPU 飙高）。
+  function describe(a) {
     try {
       if (a === null) return 'null';
       if (a === undefined) return 'undefined';
 
       const t = typeof a;
-      if (t === 'string') return a;
+      if (t === 'string') return a.length > MAX_TEXT ? a.slice(0, MAX_TEXT) + '…' : a;
       if (t === 'number' || t === 'boolean' || t === 'bigint') return String(a);
       if (t === 'symbol') return a.toString();
       if (t === 'function') return '[function ' + (a.name || 'anonymous') + ']';
 
-      if (a instanceof Error) return a.stack || a.message || String(a);
-
-      if (Array.isArray(a)) {
-        const head = a.slice(0, 20).map((v) => stringifyShallow(v));
-        return '[' + head.join(', ') + (a.length > 20 ? ', …共 ' + a.length + ' 项' : '') + ']';
+      if (Array.isArray(a)) return '[Array(' + a.length + ')]';
+      if (a instanceof Date) {
+        try {
+          return a.toISOString();
+        } catch (e) {
+          return '[Date]';
+        }
+      }
+      if (a instanceof Error) {
+        // Error 的 message/stack 是自有数据属性，安全；仍然加保护
+        try {
+          return a.stack || a.message || '[Error]';
+        } catch (e) {
+          return '[Error]';
+        }
       }
 
-      if (a instanceof Date) return a.toISOString();
-
       if (t === 'object') {
+        // 只取构造函数名，不枚举、不读取任何字段
         const name = (a.constructor && a.constructor.name) || 'Object';
-        const keys = Object.keys(a);
-        const head = keys.slice(0, 12).map((k) => k + ': ' + stringifyShallow(a[k]));
-        return (
-          name + ' { ' + head.join(', ') + (keys.length > 12 ? ', …共 ' + keys.length + ' 个字段' : '') + ' }'
-        );
+        return '[' + name + ']';
       }
 
       return String(a);
     } catch (e) {
-      return '[无法序列化]';
-    }
-  }
-
-  // 只取一层，不做递归
-  function stringifyShallow(v) {
-    try {
-      if (v === null) return 'null';
-      if (v === undefined) return 'undefined';
-      const t = typeof v;
-      if (t === 'string') return JSON.stringify(v.length > 80 ? v.slice(0, 80) + '…' : v);
-      if (t === 'number' || t === 'boolean' || t === 'bigint') return String(v);
-      if (t === 'function') return '[function]';
-      if (v instanceof Error) return '[Error: ' + (v.message || '') + ']';
-      if (Array.isArray(v)) return '[Array(' + v.length + ')]';
-      if (v instanceof Date) return v.toISOString();
-      if (t === 'object') return (v.constructor && v.constructor.name) || 'Object';
-      return String(v);
-    } catch (e) {
-      return '[?]';
+      return '[无法描述的参数]';
     }
   }
 
   function push(level, args) {
     if (!window.__ccRunning) return;
-    const buf = window.__ccBuffer;
-    let text = args.map(stringifyArg).join(' ');
+    let text;
+    if (args.length === 1) {
+      text = describe(args[0]);
+    } else {
+      const parts = new Array(args.length);
+      for (let i = 0; i < args.length; i++) parts[i] = describe(args[i]);
+      text = parts.join(' ');
+    }
     if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT) + '…[已截断]';
-    buf.push({ level, text, time: Date.now() });
-    // 超过上限丢最旧的：宁可丢日志，也不能让页面内存无限增长
-    if (buf.length > MAX_BUFFER) buf.splice(0, buf.length - MAX_BUFFER);
+    ringPush({ level, text, time: Date.now() });
   }
+
+  const EMPTY_ARGS = [];
 
   const methods = ['log', 'warn', 'error', 'info', 'debug'];
   methods.forEach((m) => {
@@ -392,10 +435,18 @@ function mainWorldCapture() {
     if (typeof orig !== 'function') return;
     // 通过标记保证即使外部脚本重复注入也只包装一次
     if (orig.__ccWrapped) return;
-    const wrapped = function (...args) {
-      orig.apply(console, args);
+    // 用固定参数位而不是 rest（...args），避免每次调用都新建数组
+    const wrapped = function (a0, a1, a2, a3, a4) {
+      if (orig) orig.apply(console, arguments);
       try {
-        push(m, args);
+        const n = arguments.length;
+        if (n === 0) {
+          push(m, EMPTY_ARGS);
+        } else {
+          const args = new Array(n);
+          for (let i = 0; i < n; i++) args[i] = arguments[i];
+          push(m, args);
+        }
       } catch (e) {
         // 采集过程绝不能影响页面本身
       }
@@ -407,15 +458,14 @@ function mainWorldCapture() {
   window.addEventListener('error', (e) => {
     try {
       if (!window.__ccRunning) return;
-      const text = ((e.error && e.error.stack) || e.message || '') + '';
-      window.__ccBuffer.push({
-        level: 'uncaught-exception',
-        text: text.length > MAX_TEXT ? text.slice(0, MAX_TEXT) + '…[已截断]' : text,
-        time: Date.now(),
-      });
-      if (window.__ccBuffer.length > MAX_BUFFER) {
-        window.__ccBuffer.splice(0, window.__ccBuffer.length - MAX_BUFFER);
+      let text = '';
+      try {
+        text = String((e.error && e.error.stack) || e.message || '');
+      } catch (err) {
+        text = '[错误对象无法读取]';
       }
+      if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT) + '…[已截断]';
+      ringPush({ level: 'uncaught-exception', text, time: Date.now() });
     } catch (err) {}
   });
 
@@ -428,29 +478,66 @@ function mainWorldCapture() {
       } catch (err) {
         text = '[无法转换的 rejection 原因]';
       }
-      window.__ccBuffer.push({
-        level: 'unhandled-rejection',
-        text: text.length > MAX_TEXT ? text.slice(0, MAX_TEXT) + '…[已截断]' : text,
-        time: Date.now(),
-      });
-      if (window.__ccBuffer.length > MAX_BUFFER) {
-        window.__ccBuffer.splice(0, window.__ccBuffer.length - MAX_BUFFER);
-      }
+      if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT) + '…[已截断]';
+      ringPush({ level: 'unhandled-rejection', text, time: Date.now() });
     } catch (err) {}
   });
 
   function flush() {
     if (!window.__ccRunning) return;
-    const buf = window.__ccBuffer;
-    if (buf.length === 0) return;
-    // 一次最多搬运 MAX_BUFFER 条，splice 之后缓冲区立即释放
-    const batch = buf.splice(0, buf.length);
-    try {
-      window.postMessage({ __ccBatch: true, batch }, '*');
-    } catch (err) {
-      // postMessage 失败（理论上不会）时直接丢弃这一批，不重试堆积
+    // 循环排空：每次最多搬 MAX_BATCH 条，避免单个巨型批次，
+    // 但也不让日志在缓冲里积压（有上限保护，最多转几次就空了）。
+    for (let i = 0; i < 20; i++) {
+      const batch = ringDrain(MAX_BATCH);
+      if (!batch || batch.length === 0) return;
+      try {
+        window.postMessage({ __ccBatch: true, batch }, '*');
+      } catch (err) {
+        // postMessage 失败（理论上不会）时直接丢弃这一批，不重试堆积
+        return;
+      }
+      if (batch.length < MAX_BATCH) return;
     }
   }
+
+  // 采集开销自测：量一段真实的单条日志成本（describe + 环形缓冲写入），
+  // 结果发回侧边栏显示，用来判断是不是这段代码在吃页面 CPU。
+  function measureCost() {
+    const N = 20000;
+    const sample = [
+      'MainName关闭界面 UILogin goTo checkTaskJumpRes onTick render nextFrame update',
+      12345,
+      { a: 1, b: 2, c: 3 },
+      [1, 2, 3],
+    ];
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) {
+      const parts = new Array(sample.length);
+      for (let j = 0; j < sample.length; j++) parts[j] = describe(sample[j]);
+      ringPush({ level: 'log', text: parts.join(' '), time: 0 });
+    }
+    const elapsed = performance.now() - t0;
+    // 测完把这几万条塞进去的内容清掉，避免污染真实日志
+    ringLen = 0;
+    ringHead = 0;
+    return (elapsed / N) * 1000; // 返回 µs/条
+  }
+
+  // 侧边栏请求自测时回一个结果
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (event.data && event.data.__ccMeasureRequest) {
+      let us = -1;
+      try {
+        us = measureCost();
+      } catch (e) {
+        us = -1;
+      }
+      try {
+        window.postMessage({ __ccMeasureResult: us }, '*');
+      } catch (e) {}
+    }
+  });
 
   setInterval(flush, FLUSH_MS);
 
@@ -467,7 +554,9 @@ function bridgeInject() {
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     const data = event.data;
-    if (data && data.__ccBatch) {
+    if (!data) return;
+
+    if (data.__ccBatch) {
       try {
         const p = chrome.runtime.sendMessage({ type: 'cc-log-batch', batch: data.batch });
         // 侧边栏关闭或插件重载时这里会 reject，必须消化掉，
@@ -476,14 +565,21 @@ function bridgeInject() {
       } catch (e) {
         // 扩展上下文失效（Extension context invalidated），静默忽略
       }
+      return;
+    }
+
+    // 自测结果：转发给侧边栏（侧边栏和页面不是同一个 window，收不到页面自己发的消息）
+    if (typeof data.__ccMeasureResult === 'number') {
+      try {
+        const p = chrome.runtime.sendMessage({ type: 'cc-measure-result', us: data.__ccMeasureResult });
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch (e) {}
     }
   });
 }
 
 function stopMainWorld() {
   window.__ccRunning = false;
-  // 停止时顺手丢弃未发出的缓冲，避免残留数据继续往侧边栏搬
-  if (window.__ccBuffer && window.__ccBuffer.length) window.__ccBuffer.length = 0;
 }
 
 // ---------- 批次落地：展示 + 落盘 ----------
@@ -505,6 +601,7 @@ async function appendBatch(batch) {
 
     categoryCounts[category]++;
     totalCount++;
+    rateWindowCount++;
 
     // 追加到视图数组，超出上限时从头部丢弃（DOM 会在渲染时同步裁剪）
     displayRows.push(row);
@@ -537,8 +634,11 @@ async function appendBatch(batch) {
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === 'cc-log-batch' && running) {
+  if (!msg) return;
+  if (msg.type === 'cc-log-batch' && running) {
     appendBatch(msg.batch);
+  } else if (msg.type === 'cc-measure-result') {
+    measureResolve(msg.us);
   }
 });
 
@@ -596,6 +696,7 @@ startBtn.addEventListener('click', async () => {
     startBtn.disabled = true;
     stopBtn.disabled = false;
     changeDirBtn.disabled = true;
+    startRateTimer();
     setStatus(`采集中 → ${fileHandle.name}`, 'running');
   } catch (e) {
     setStatus('开始失败：' + e.message, 'error');
@@ -604,6 +705,7 @@ startBtn.addEventListener('click', async () => {
 
 async function stopCapture(reason) {
   running = false;
+  stopRateTimer();
   if (targetTabId != null) {
     try {
       await chrome.scripting.executeScript({ target: { tabId: targetTabId }, world: 'MAIN', func: stopMainWorld });
@@ -665,6 +767,50 @@ clearBtn.addEventListener('click', () => {
   displayRows = [];
   lastRenderedSeq = null;
   rebuildView();
+});
+
+// ---------- 自测：量页面侧每条日志的真实开销 ----------
+diagBtn.addEventListener('click', async () => {
+  if (targetTabId == null) {
+    setStatus('请先点「开始」选定一个目标标签页，再自测', 'error');
+    return;
+  }
+  setStatus('正在自测…（会在目标页面里跑 2 万次采集逻辑，约一两秒）', 'running');
+
+  const result = await new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      resolve(v);
+    };
+    measureResolve = (us) => finish(us);
+
+    chrome.scripting
+      .executeScript({
+        target: { tabId: targetTabId },
+        func: () => window.postMessage({ __ccMeasureRequest: true }, '*'),
+      })
+      .catch(() => finish(-1));
+
+    setTimeout(() => finish(-1), 8000);
+  });
+
+  measureResolve = () => {};
+
+  if (result === null || result < 0) {
+    setStatus('自测没有拿到结果（页面里可能还没注入采集脚本，请先点「开始」并刷新页面）', 'error');
+    return;
+  }
+
+  const perLineUs = result;
+  const at100 = (perLineUs * 100) / 1000; // 100 条/秒时，每秒占用主线程的毫秒数
+  setStatus(
+    `自测结果：每条日志在页面里约 ${perLineUs.toFixed(2)} µs\n` +
+      `按 100 条/秒 估算：约 ${at100.toFixed(2)} ms/秒，占主线程 ${(at100 / 10).toFixed(2)}%\n` +
+      `当前实际速率：${currentRate} 条/秒`,
+    'running'
+  );
 });
 
 // ---------- 级别筛选 / 搜索 / 合并 ----------
