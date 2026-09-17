@@ -22,7 +22,19 @@ const statChips = {
 const prevErrorBtn = document.getElementById('prevErrorBtn');
 const nextErrorBtn = document.getElementById('nextErrorBtn');
 
-const MAX_LINES = 5000;
+// 视图里保留的最大行数。这个数字直接决定了侧边栏占多少内存和 DOM 节点数，
+// 不要调太大：每多一行就多一个常驻 DOM 节点，浏览器长时间运行会明显变卡。
+const MAX_DISPLAY_ROWS = 2000;
+// 错误汇总文件的行数上限，防止游戏刷错误时数组无限膨胀吃光内存
+const MAX_ERROR_SUMMARY = 5000;
+// 单条日志文本的长度上限
+const MAX_TEXT_LENGTH = 2000;
+// 页面侧缓冲区的上限：超过就丢最旧的，宁可丢日志也不能让浏览器卡死
+const MAX_PAGE_BUFFER = 2000;
+// 每批最多处理多少条（防御异常情况下的超大 batch）
+const MAX_BATCH_SIZE = 3000;
+// 渲染节流间隔
+const RENDER_THROTTLE_MS = 250;
 const SCROLL_BOTTOM_THRESHOLD = 30;
 
 // 把捕获到的原始 level 归到 DevTools 风格的四个分类
@@ -39,13 +51,25 @@ const LEVEL_TO_CATEGORY = {
 let targetTabId = null;
 let dirHandle = null;
 let writable = null;
-let rawEntries = []; // { level, category, text, time }
 let totalCount = 0;
+let droppedCount = 0;
 let running = false;
 let autoScroll = true;
 let currentSessionTs = null;
+let errorSummaryTruncated = false;
+
+// 累计计数从「开始」起算，不受视图上限裁剪影响
 let categoryCounts = { verbose: 0, info: 0, warnings: 0, errors: 0 };
+// 错误汇总内容（有上限，供停止时写汇总文件用）
 let errorSummaryLines = [];
+// 当前视图里的行：只保留最近 MAX_DISPLAY_ROWS 条
+let displayRows = [];
+// 视图里已经渲染成 DOM 的行数。单独记这个数（而不是用 viewEls.length），
+// 因为 displayRows 可能在上一次渲染之后被裁剪过，两者会对不上。
+let renderedCount = 0;
+// 渲染节流
+let renderTimer = null;
+let pendingRebuild = false;
 
 // ---------- IndexedDB：记住上次选择的保存目录句柄 ----------
 const DB_NAME = 'console-capture-db';
@@ -112,33 +136,6 @@ function updateStatsBar() {
   nextErrorBtn.disabled = categoryCounts.errors === 0;
 }
 
-// 只显示某个级别（点击统计条上的分类时用）
-function showOnlyCategory(category) {
-  levelCheckboxes.forEach((cb) => {
-    cb.checked = cb.dataset.level === category;
-  });
-  filterAllEl.checked = false;
-  renderLog();
-}
-
-// 在当前渲染出来的日志里，跳到上一条/下一条 Errors
-function jumpToError(direction) {
-  const errorEls = Array.from(logViewEl.querySelectorAll('.log-errors'));
-  if (errorEls.length === 0) return;
-  const currentScroll = logViewEl.scrollTop;
-  let target;
-  if (direction === 'next') {
-    target = errorEls.find((el) => el.offsetTop > currentScroll + 5) || errorEls[errorEls.length - 1];
-  } else {
-    const before = errorEls.filter((el) => el.offsetTop < currentScroll - 5);
-    target = before.length ? before[before.length - 1] : errorEls[0];
-  }
-  autoScroll = false;
-  logViewEl.scrollTop = Math.max(0, target.offsetTop - 8);
-  jumpBottomBtn.style.display =
-    logViewEl.scrollHeight - logViewEl.scrollTop - logViewEl.clientHeight < SCROLL_BOTTOM_THRESHOLD ? 'none' : 'block';
-}
-
 function setStatus(text, kind) {
   statusEl.textContent = text;
   statusEl.className = kind;
@@ -148,53 +145,139 @@ function renderTabInfo(tab) {
   tabInfoEl.textContent = tab ? `目标标签页：${tab.title}\n${tab.url}` : '尚未选择标签页';
 }
 
-function formatLine(entry) {
-  const time = new Date(entry.time).toISOString();
-  return `[${time}] [${entry.level}] ${entry.text}`;
+function formatLine(row) {
+  const time = new Date(row.time).toISOString();
+  return `[${time}] [${row.level}] ${row.text}`;
 }
 
-// 把连续且内容相同（同分类+同文本）的条目合并成一条，附带次数
-function buildDisplayGroups(entries) {
-  const groups = [];
-  for (const e of entries) {
-    const last = groups[groups.length - 1];
-    if (last && last.category === e.category && last.text === e.text && last.level === e.level) {
-      last.count++;
-      last.time = e.time;
-    } else {
-      groups.push({ level: e.level, category: e.category, text: e.text, time: e.time, count: 1 });
-    }
-  }
-  return groups;
+function rowText(row) {
+  return formatLine(row) + (row.count > 1 ? ` (×${row.count})` : '');
 }
 
-function renderLog() {
-  const activeCats = new Set(activeCategories());
-  const term = searchInput.value.trim().toLowerCase();
+function updateLineCount() {
+  const parts = [`共 ${totalCount} 条`];
+  if (droppedCount > 0) parts.push(`因上限丢弃 ${droppedCount} 条`);
+  parts.push(`视图保留 ${displayRows.length} 行`);
+  if (mergeToggle.checked) parts.push('已合并重复');
+  lineCountEl.textContent = parts.join('，');
+}
 
-  let filtered = rawEntries.filter((e) => activeCats.has(e.category));
-  if (term) {
-    filtered = filtered.filter((e) => e.text.toLowerCase().includes(term));
-  }
-  const groups = mergeToggle.checked ? buildDisplayGroups(filtered) : filtered.map((e) => ({ ...e, count: 1 }));
-
-  const frag = document.createDocumentFragment();
-  for (const g of groups) {
-    const div = document.createElement('div');
-    div.className = 'log-line log-' + g.category;
-    div.textContent = formatLine(g) + (g.count > 1 ? ` (×${g.count})` : '');
-    frag.appendChild(div);
-  }
-  logViewEl.replaceChildren(frag);
-
+function scrollToBottomIfNeeded() {
   if (autoScroll) {
     logViewEl.scrollTop = logViewEl.scrollHeight;
     jumpBottomBtn.style.display = 'none';
   }
+}
 
-  const suffix = mergeToggle.checked ? '（已合并重复）' : '';
-  lineCountEl.textContent = `共 ${totalCount} 条，当前显示 ${groups.length} 条${suffix}`;
+function createRowEl(row) {
+  const div = document.createElement('div');
+  div.className = 'log-line log-' + row.category;
+  div.textContent = rowText(row);
+  return div;
+}
+
+// 按当前筛选条件重建整个视图（只在筛选/搜索/合并变化时调用）
+function rebuildView() {
+  const activeCats = new Set(activeCategories());
+  const term = searchInput.value.trim().toLowerCase();
+
+  // 先按筛选条件过一遍，再按需要合并相邻重复
+  const filtered = displayRows.filter((r) => {
+    if (!activeCats.has(r.category)) return false;
+    if (term && !r.text.toLowerCase().includes(term)) return false;
+    return true;
+  });
+
+  let rows;
+  if (mergeToggle.checked) {
+    rows = [];
+    for (const r of filtered) {
+      const last = rows[rows.length - 1];
+      if (last && last.category === r.category && last.text === r.text && last.level === r.level) {
+        last.count += r.count;
+        last.time = r.time;
+      } else {
+        rows.push({ level: r.level, category: r.category, text: r.text, time: r.time, count: r.count });
+      }
+    }
+  } else {
+    rows = filtered.map((r) => ({ ...r, count: 1 }));
+    // 关掉合并时，如果原始行本身就是合并过的统计行，用计数拆开展示会更准；
+    // 但为控制 DOM 数量，这里直接按 1 行近似展示，不做拆分。
+  }
+
+  const frag = document.createDocumentFragment();
+  for (const row of rows) {
+    frag.appendChild(createRowEl(row));
+  }
+  logViewEl.replaceChildren(frag);
+  renderedCount = rows.length;
+  scrollToBottomIfNeeded();
+  updateLineCount();
   updateFilterSummary();
+}
+
+function scheduleRender(rebuild) {
+  if (rebuild) pendingRebuild = true;
+  if (renderTimer) return;
+  renderTimer = setTimeout(() => {
+    renderTimer = null;
+    const doRebuild = pendingRebuild;
+    pendingRebuild = false;
+    if (doRebuild) {
+      rebuildView();
+    } else {
+      appendNewRows();
+    }
+  }, RENDER_THROTTLE_MS);
+}
+
+// 增量追加：只有"无筛选、无搜索、不合并"这种最常见的情况才走这条路
+function canAppendIncrementally() {
+  return (
+    !mergeToggle.checked && !searchInput.value.trim() && activeCategories().length === levelCheckboxes.length
+  );
+}
+
+function appendNewRows() {
+  if (!canAppendIncrementally()) {
+    rebuildView();
+    return;
+  }
+
+  // 还没渲染过、或者视图被裁剪到比已渲染行数还少（说明有旧行被丢掉了），都重建一次
+  if (renderedCount === 0 || renderedCount > displayRows.length) {
+    rebuildView();
+    return;
+  }
+
+  const rowsToAppend = displayRows.slice(renderedCount);
+  if (rowsToAppend.length === 0) {
+    updateLineCount();
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  for (const row of rowsToAppend) {
+    frag.appendChild(createRowEl(row));
+  }
+  logViewEl.appendChild(frag);
+  renderedCount += rowsToAppend.length;
+
+  // DOM 节点数超过上限时，只删掉超出的那部分（从头部删），
+  // 让剩余行数与 displayRows 保持一致。
+  const excess = renderedCount - MAX_DISPLAY_ROWS;
+  if (excess > 0) {
+    for (let i = 0; i < excess; i++) {
+      const el = logViewEl.firstChild;
+      if (!el) break;
+      logViewEl.removeChild(el);
+    }
+    renderedCount = MAX_DISPLAY_ROWS;
+  }
+
+  scrollToBottomIfNeeded();
+  updateLineCount();
 }
 
 async function getActiveTab() {
@@ -204,52 +287,161 @@ async function getActiveTab() {
 
 // ---------- 注入到页面的采集脚本 ----------
 
-// MAIN world：覆写 console 方法，缓冲后通过 postMessage 打包发出
+// MAIN world：覆写 console 方法，缓冲后通过 postMessage 打包发出。
+// 这个函数会被序列化后注入页面，不能引用外部作用域的任何变量。
 function mainWorldCapture() {
-  if (window.__ccStarted) return;
-  window.__ccStarted = true;
-  window.__ccBuffer = window.__ccBuffer || [];
+  // 装上就不再卸：避免反复「开始」导致 console 被层层包装，
+  // 每包一层，一条日志就要多做一次序列化和入队（曾导致主线程被打满）。
+  if (window.__ccInstalled) {
+    window.__ccRunning = true;
+    return;
+  }
+  window.__ccInstalled = true;
+  window.__ccRunning = true;
+  window.__ccBuffer = [];
 
-  function safeStringify(a) {
+  const MAX_BUFFER = 2000; // 缓冲区上限，超出丢最旧的，防止后台节流时无限膨胀
+  const MAX_TEXT = 2000; // 单条文本上限，防止一条巨型日志把内存顶爆
+  const FLUSH_MS = 300;
+
+  // 不做深递归序列化：页面对象（如 Cocos 的 Node）常有循环引用，
+  // JSON.stringify 会先遍历整棵对象图才抛错，代价全部落在页面主线程上。
+  function stringifyArg(a) {
     try {
-      if (typeof a === 'string') return a;
-      if (a instanceof Error) return a.stack || a.message;
-      return JSON.stringify(a);
-    } catch (e) {
+      if (a === null) return 'null';
+      if (a === undefined) return 'undefined';
+
+      const t = typeof a;
+      if (t === 'string') return a;
+      if (t === 'number' || t === 'boolean' || t === 'bigint') return String(a);
+      if (t === 'symbol') return a.toString();
+      if (t === 'function') return '[function ' + (a.name || 'anonymous') + ']';
+
+      if (a instanceof Error) return a.stack || a.message || String(a);
+
+      if (Array.isArray(a)) {
+        const head = a.slice(0, 20).map((v) => stringifyShallow(v));
+        return '[' + head.join(', ') + (a.length > 20 ? ', …共 ' + a.length + ' 项' : '') + ']';
+      }
+
+      if (a instanceof Date) return a.toISOString();
+
+      if (t === 'object') {
+        const name = (a.constructor && a.constructor.name) || 'Object';
+        const keys = Object.keys(a);
+        const head = keys.slice(0, 12).map((k) => k + ': ' + stringifyShallow(a[k]));
+        return (
+          name + ' { ' + head.join(', ') + (keys.length > 12 ? ', …共 ' + keys.length + ' 个字段' : '') + ' }'
+        );
+      }
+
       return String(a);
+    } catch (e) {
+      return '[无法序列化]';
     }
+  }
+
+  // 只取一层，不做递归
+  function stringifyShallow(v) {
+    try {
+      if (v === null) return 'null';
+      if (v === undefined) return 'undefined';
+      const t = typeof v;
+      if (t === 'string') return JSON.stringify(v.length > 80 ? v.slice(0, 80) + '…' : v);
+      if (t === 'number' || t === 'boolean' || t === 'bigint') return String(v);
+      if (t === 'function') return '[function]';
+      if (v instanceof Error) return '[Error: ' + (v.message || '') + ']';
+      if (Array.isArray(v)) return '[Array(' + v.length + ')]';
+      if (v instanceof Date) return v.toISOString();
+      if (t === 'object') return (v.constructor && v.constructor.name) || 'Object';
+      return String(v);
+    } catch (e) {
+      return '[?]';
+    }
+  }
+
+  function push(level, args) {
+    if (!window.__ccRunning) return;
+    const buf = window.__ccBuffer;
+    let text = args.map(stringifyArg).join(' ');
+    if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT) + '…[已截断]';
+    buf.push({ level, text, time: Date.now() });
+    // 超过上限丢最旧的：宁可丢日志，也不能让页面内存无限增长
+    if (buf.length > MAX_BUFFER) buf.splice(0, buf.length - MAX_BUFFER);
   }
 
   const methods = ['log', 'warn', 'error', 'info', 'debug'];
   methods.forEach((m) => {
     const orig = console[m];
-    console[m] = function (...args) {
+    if (typeof orig !== 'function') return;
+    // 通过标记保证即使外部脚本重复注入也只包装一次
+    if (orig.__ccWrapped) return;
+    const wrapped = function (...args) {
       orig.apply(console, args);
-      window.__ccBuffer.push({ level: m, text: args.map(safeStringify).join(' '), time: Date.now() });
+      try {
+        push(m, args);
+      } catch (e) {
+        // 采集过程绝不能影响页面本身
+      }
     };
+    wrapped.__ccWrapped = true;
+    console[m] = wrapped;
   });
 
   window.addEventListener('error', (e) => {
-    window.__ccBuffer.push({
-      level: 'uncaught-exception',
-      text: (e.error && e.error.stack) || e.message,
-      time: Date.now(),
-    });
+    try {
+      if (!window.__ccRunning) return;
+      const text = ((e.error && e.error.stack) || e.message || '') + '';
+      window.__ccBuffer.push({
+        level: 'uncaught-exception',
+        text: text.length > MAX_TEXT ? text.slice(0, MAX_TEXT) + '…[已截断]' : text,
+        time: Date.now(),
+      });
+      if (window.__ccBuffer.length > MAX_BUFFER) {
+        window.__ccBuffer.splice(0, window.__ccBuffer.length - MAX_BUFFER);
+      }
+    } catch (err) {}
   });
 
   window.addEventListener('unhandledrejection', (e) => {
-    window.__ccBuffer.push({ level: 'unhandled-rejection', text: String(e.reason), time: Date.now() });
+    try {
+      if (!window.__ccRunning) return;
+      let text;
+      try {
+        text = String(e.reason);
+      } catch (err) {
+        text = '[无法转换的 rejection 原因]';
+      }
+      window.__ccBuffer.push({
+        level: 'unhandled-rejection',
+        text: text.length > MAX_TEXT ? text.slice(0, MAX_TEXT) + '…[已截断]' : text,
+        time: Date.now(),
+      });
+      if (window.__ccBuffer.length > MAX_BUFFER) {
+        window.__ccBuffer.splice(0, window.__ccBuffer.length - MAX_BUFFER);
+      }
+    } catch (err) {}
   });
 
-  const timer = setInterval(() => {
-    if (!window.__ccStarted) {
-      clearInterval(timer);
-      return;
+  function flush() {
+    if (!window.__ccRunning) return;
+    const buf = window.__ccBuffer;
+    if (buf.length === 0) return;
+    // 一次最多搬运 MAX_BUFFER 条，splice 之后缓冲区立即释放
+    const batch = buf.splice(0, buf.length);
+    try {
+      window.postMessage({ __ccBatch: true, batch }, '*');
+    } catch (err) {
+      // postMessage 失败（理论上不会）时直接丢弃这一批，不重试堆积
     }
-    if (window.__ccBuffer.length === 0) return;
-    const batch = window.__ccBuffer.splice(0, window.__ccBuffer.length);
-    window.postMessage({ __ccBatch: true, batch }, '*');
-  }, 300);
+  }
+
+  setInterval(flush, FLUSH_MS);
+
+  // 页面切到后台时 setInterval 会被浏览器节流到一分钟一次，
+  // 这里在切后台/切回来的时机补一次排空，避免缓冲区在后台堆积。
+  document.addEventListener('visibilitychange', flush);
+  window.addEventListener('pagehide', flush);
 }
 
 // ISOLATED world（默认）：把 MAIN world 的 postMessage 转发给扩展的 runtime 消息
@@ -261,38 +453,62 @@ function bridgeInject() {
     const data = event.data;
     if (data && data.__ccBatch) {
       try {
-        chrome.runtime.sendMessage({ type: 'cc-log-batch', batch: data.batch });
+        const p = chrome.runtime.sendMessage({ type: 'cc-log-batch', batch: data.batch });
+        // 侧边栏关闭或插件重载时这里会 reject，必须消化掉，
+        // 否则每 300ms 产生一个未处理异常，反过来拖慢页面
+        if (p && typeof p.catch === 'function') p.catch(() => {});
       } catch (e) {
-        // 插件重新加载/更新后，旧的扩展上下文会失效（Extension context invalidated），
-        // 这里静默忽略，避免污染页面自己的 console
+        // 扩展上下文失效（Extension context invalidated），静默忽略
       }
     }
   });
 }
 
 function stopMainWorld() {
-  window.__ccStarted = false;
+  window.__ccRunning = false;
+  // 停止时顺手丢弃未发出的缓冲，避免残留数据继续往侧边栏搬
+  if (window.__ccBuffer && window.__ccBuffer.length) window.__ccBuffer.length = 0;
 }
 
 // ---------- 批次落地：展示 + 落盘 ----------
 async function appendBatch(batch) {
+  if (!Array.isArray(batch) || batch.length === 0) return;
+
+  // 防御异常情况下的大 batch
+  let entries = batch;
+  if (entries.length > MAX_BATCH_SIZE) {
+    droppedCount += entries.length - MAX_BATCH_SIZE;
+    entries = entries.slice(entries.length - MAX_BATCH_SIZE);
+  }
+
   const fileLines = [];
-  for (const entry of batch) {
+  for (const entry of entries) {
     const category = LEVEL_TO_CATEGORY[entry.level] || 'info';
-    rawEntries.push({ ...entry, category });
-    const line = formatLine(entry);
-    fileLines.push(line);
+    const row = { level: entry.level, category, text: entry.text, time: entry.time, count: 1 };
+
     categoryCounts[category]++;
+    totalCount++;
+
+    // 追加到视图数组，超出上限时从头部丢弃（DOM 会在渲染时同步裁剪）
+    displayRows.push(row);
+    if (displayRows.length > MAX_DISPLAY_ROWS) {
+      displayRows.splice(0, displayRows.length - MAX_DISPLAY_ROWS);
+    }
+
+    const line = formatLine(row);
+    fileLines.push(line);
     if (category === 'errors') {
       errorSummaryLines.push(line);
+      if (errorSummaryLines.length > MAX_ERROR_SUMMARY) {
+        errorSummaryLines.shift();
+        errorSummaryTruncated = true;
+      }
     }
   }
-  totalCount += batch.length;
-  if (rawEntries.length > MAX_LINES) {
-    rawEntries = rawEntries.slice(rawEntries.length - MAX_LINES);
-  }
+
   updateStatsBar();
-  renderLog();
+  // 视图按节流渲染，不做全量重建
+  scheduleRender(false);
 
   if (writable) {
     try {
@@ -304,7 +520,7 @@ async function appendBatch(batch) {
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'cc-log-batch' && running) {
+  if (msg && msg.type === 'cc-log-batch' && running) {
     appendBatch(msg.batch);
   }
 });
@@ -348,12 +564,14 @@ startBtn.addEventListener('click', async () => {
     await chrome.scripting.executeScript({ target: { tabId: targetTabId }, func: bridgeInject });
 
     // 新一次采集：重置计数和视图，避免和上一次的数据混在一起
-    rawEntries = [];
-    totalCount = 0;
-    categoryCounts = { verbose: 0, info: 0, warnings: 0, errors: 0 };
+    displayRows = [];
     errorSummaryLines = [];
+    errorSummaryTruncated = false;
+    categoryCounts = { verbose: 0, info: 0, warnings: 0, errors: 0 };
+    totalCount = 0;
+    droppedCount = 0;
     updateStatsBar();
-    renderLog();
+    rebuildView();
 
     running = true;
     startBtn.disabled = true;
@@ -374,6 +592,10 @@ async function stopCapture(reason) {
       // 标签页可能已关闭，忽略
     }
   }
+  if (renderTimer) {
+    clearTimeout(renderTimer);
+    renderTimer = null;
+  }
   if (writable) {
     try {
       await writable.close();
@@ -392,7 +614,9 @@ async function stopCapture(reason) {
       const errWritable = await errFileHandle.createWritable({ keepExistingData: false });
       await errWritable.write(errorSummaryLines.join('\n') + '\n');
       await errWritable.close();
-      errorFileNote = `\n错误汇总：${errFileHandle.name}（共 ${errorSummaryLines.length} 条）`;
+      errorFileNote =
+        `\n错误汇总：${errFileHandle.name}（本次记录 ${errorSummaryLines.length} 条` +
+        `${errorSummaryTruncated ? '，已达上限，更早的错误未包含' : ''}）`;
     } catch (e) {
       errorFileNote = '\n错误汇总文件写入失败：' + e.message;
     }
@@ -419,15 +643,15 @@ changeDirBtn.addEventListener('click', async () => {
 
 clearBtn.addEventListener('click', () => {
   // 只清空视图，累计的统计数字和错误汇总保持不变
-  rawEntries = [];
-  renderLog();
+  displayRows = [];
+  rebuildView();
 });
 
 // ---------- 级别筛选 / 搜索 / 合并 ----------
 levelCheckboxes.forEach((cb) => {
   cb.addEventListener('change', () => {
     filterAllEl.checked = levelCheckboxes.every((c) => c.checked);
-    renderLog();
+    scheduleRender(true);
   });
 });
 
@@ -435,13 +659,39 @@ filterAllEl.addEventListener('change', () => {
   levelCheckboxes.forEach((cb) => {
     cb.checked = filterAllEl.checked;
   });
-  renderLog();
+  scheduleRender(true);
 });
 
-searchInput.addEventListener('input', () => renderLog());
-mergeToggle.addEventListener('change', () => renderLog());
+searchInput.addEventListener('input', () => scheduleRender(true));
+mergeToggle.addEventListener('change', () => scheduleRender(true));
 
 // ---------- 统计条 / 错误跳转 ----------
+function showOnlyCategory(category) {
+  levelCheckboxes.forEach((cb) => {
+    cb.checked = cb.dataset.level === category;
+  });
+  filterAllEl.checked = false;
+  rebuildView();
+}
+
+// 在当前渲染出来的日志里，跳到上一条/下一条 Errors
+function jumpToError(direction) {
+  const errorEls = Array.from(logViewEl.querySelectorAll('.log-errors'));
+  if (errorEls.length === 0) return;
+  const currentScroll = logViewEl.scrollTop;
+  let target;
+  if (direction === 'next') {
+    target = errorEls.find((el) => el.offsetTop > currentScroll + 5) || errorEls[errorEls.length - 1];
+  } else {
+    const before = errorEls.filter((el) => el.offsetTop < currentScroll - 5);
+    target = before.length ? before[before.length - 1] : errorEls[0];
+  }
+  autoScroll = false;
+  logViewEl.scrollTop = Math.max(0, target.offsetTop - 8);
+  jumpBottomBtn.style.display =
+    logViewEl.scrollHeight - logViewEl.scrollTop - logViewEl.clientHeight < SCROLL_BOTTOM_THRESHOLD ? 'none' : 'block';
+}
+
 Object.entries(statChips).forEach(([category, el]) => {
   el.addEventListener('click', () => showOnlyCategory(category));
 });
@@ -469,6 +719,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 window.addEventListener('beforeunload', () => {
+  // 侧边栏关闭时通知页面停止采集，避免页面继续把日志往一个没人接收的地方发
+  if (running && targetTabId != null) {
+    try {
+      chrome.scripting.executeScript({ target: { tabId: targetTabId }, world: 'MAIN', func: stopMainWorld });
+    } catch (e) {
+      // 忽略
+    }
+  }
   if (writable) {
     writable.close().catch(() => {});
   }
@@ -492,3 +750,4 @@ loadDirHandle()
   .catch(() => {});
 
 updateStatsBar();
+updateLineCount();
