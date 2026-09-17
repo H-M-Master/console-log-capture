@@ -64,9 +64,11 @@ let categoryCounts = { verbose: 0, info: 0, warnings: 0, errors: 0 };
 let errorSummaryLines = [];
 // 当前视图里的行：只保留最近 MAX_DISPLAY_ROWS 条
 let displayRows = [];
-// 视图里已经渲染成 DOM 的行数。单独记这个数（而不是用 viewEls.length），
-// 因为 displayRows 可能在上一次渲染之后被裁剪过，两者会对不上。
-let renderedCount = 0;
+// 每一行都带一个只增不减的 seq。用它来标记「视图已经渲染到哪一行了」，
+// 因为 displayRows 会被裁剪，用行数推算位置在裁剪后会算错（曾导致视图卡住不再更新）。
+let nextSeq = 0;
+// 视图里最后渲染的那一行。为 null 表示视图是空的 / 需要整体重建。
+let lastRenderedSeq = null;
 // 渲染节流
 let renderTimer = null;
 let pendingRebuild = false;
@@ -197,7 +199,14 @@ function rebuildView() {
         last.count += r.count;
         last.time = r.time;
       } else {
-        rows.push({ level: r.level, category: r.category, text: r.text, time: r.time, count: r.count });
+        rows.push({
+          level: r.level,
+          category: r.category,
+          text: r.text,
+          time: r.time,
+          count: r.count,
+          seq: r.seq,
+        });
       }
     }
   } else {
@@ -211,7 +220,8 @@ function rebuildView() {
     frag.appendChild(createRowEl(row));
   }
   logViewEl.replaceChildren(frag);
-  renderedCount = rows.length;
+  // 记录视图渲染到了哪一行，后续增量追加以它为锚点
+  lastRenderedSeq = rows.length ? rows[rows.length - 1].seq : null;
   scrollToBottomIfNeeded();
   updateLineCount();
   updateFilterSummary();
@@ -245,13 +255,20 @@ function appendNewRows() {
     return;
   }
 
-  // 还没渲染过、或者视图被裁剪到比已渲染行数还少（说明有旧行被丢掉了），都重建一次
-  if (renderedCount === 0 || renderedCount > displayRows.length) {
+  // 视图还是空的，或者没有可用的锚点，就整体重建一次
+  if (lastRenderedSeq === null || displayRows.length === 0) {
     rebuildView();
     return;
   }
 
-  const rowsToAppend = displayRows.slice(renderedCount);
+  // 已经渲染到的那个 seq 可能因为视图裁剪被丢掉了，这种情况下也重建
+  const anchorIdx = displayRows.findIndex((r) => r.seq === lastRenderedSeq);
+  if (anchorIdx === -1) {
+    rebuildView();
+    return;
+  }
+
+  const rowsToAppend = displayRows.slice(anchorIdx + 1);
   if (rowsToAppend.length === 0) {
     updateLineCount();
     return;
@@ -262,18 +279,17 @@ function appendNewRows() {
     frag.appendChild(createRowEl(row));
   }
   logViewEl.appendChild(frag);
-  renderedCount += rowsToAppend.length;
+  lastRenderedSeq = rowsToAppend[rowsToAppend.length - 1].seq;
 
-  // DOM 节点数超过上限时，只删掉超出的那部分（从头部删），
-  // 让剩余行数与 displayRows 保持一致。
-  const excess = renderedCount - MAX_DISPLAY_ROWS;
-  if (excess > 0) {
-    for (let i = 0; i < excess; i++) {
-      const el = logViewEl.firstChild;
-      if (!el) break;
-      logViewEl.removeChild(el);
-    }
-    renderedCount = MAX_DISPLAY_ROWS;
+  // DOM 节点数超过上限时，从头部删掉超出的部分。
+  // 不用去同步 lastRenderedSeq——它是尾部锚点，删头部不会影响它。
+  let renderedNow = logViewEl.childElementCount;
+  let excess = renderedNow - MAX_DISPLAY_ROWS;
+  while (excess > 0) {
+    const el = logViewEl.firstChild;
+    if (!el) break;
+    logViewEl.removeChild(el);
+    excess--;
   }
 
   scrollToBottomIfNeeded();
@@ -484,7 +500,8 @@ async function appendBatch(batch) {
   const fileLines = [];
   for (const entry of entries) {
     const category = LEVEL_TO_CATEGORY[entry.level] || 'info';
-    const row = { level: entry.level, category, text: entry.text, time: entry.time, count: 1 };
+    // seq 只增不减，用来给增量渲染定位
+    const row = { level: entry.level, category, text: entry.text, time: entry.time, count: 1, seq: nextSeq++ };
 
     categoryCounts[category]++;
     totalCount++;
@@ -565,6 +582,8 @@ startBtn.addEventListener('click', async () => {
 
     // 新一次采集：重置计数和视图，避免和上一次的数据混在一起
     displayRows = [];
+    nextSeq = 0;
+    lastRenderedSeq = null;
     errorSummaryLines = [];
     errorSummaryTruncated = false;
     categoryCounts = { verbose: 0, info: 0, warnings: 0, errors: 0 };
@@ -644,6 +663,7 @@ changeDirBtn.addEventListener('click', async () => {
 clearBtn.addEventListener('click', () => {
   // 只清空视图，累计的统计数字和错误汇总保持不变
   displayRows = [];
+  lastRenderedSeq = null;
   rebuildView();
 });
 
