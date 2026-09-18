@@ -201,6 +201,14 @@
     <input type="text" id="searchInput" placeholder="搜索关键字...">
     <label class="mergeToggleLabel"><input type="checkbox" id="mergeToggle"> 合并重复日志</label>
   </div>
+  <div class="toolbar">
+    <label class="mergeToggleLabel" title="不再调用浏览器原生 console，日志只进文件。开着 DevTools 时能显著降低页面开销">
+      <input type="checkbox" id="muteNativeToggle"> 静音（不动原生 console）
+    </label>
+    <label class="mergeToggleLabel" title="不把日志明细送进侧边栏，只实时写入文件。日志量极大时开销最低">
+      <input type="checkbox" id="fileOnlyToggle"> 只落盘（不送侧边栏）
+    </label>
+  </div>
   <div id="status" class="stopped">未开始</div>
   <div id="logWrapper">
     <div id="logView"></div>

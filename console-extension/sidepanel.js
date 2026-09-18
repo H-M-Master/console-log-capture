@@ -23,6 +23,8 @@ const prevErrorBtn = document.getElementById('prevErrorBtn');
 const nextErrorBtn = document.getElementById('nextErrorBtn');
 const diagBtn = document.getElementById('diagBtn');
 const overheadEl = document.getElementById('overhead');
+const muteNativeToggle = document.getElementById('muteNativeToggle');
+const fileOnlyToggle = document.getElementById('fileOnlyToggle');
 
 // 视图里保留的最大行数。这个数字直接决定了侧边栏占多少内存和 DOM 节点数，
 // 不要调太大：每多一行就多一个常驻 DOM 节点，浏览器长时间运行会明显变卡。
@@ -440,8 +442,19 @@ function mainWorldCapture() {
     stats.lines++;
   }
 
+  // 采集配置：由侧边栏通过 postMessage 下发（避免每次改配置都重新注入脚本）
+  const cfg = {
+    // 静音：不调用原生 console，只采集到文件。
+    // 开着 DevTools 时原生 console 是开销大头（抓栈、格式化、面板留存对象）。
+    muteNative: false,
+    // 只落盘：不把日志明细送给侧边栏，只送纯文本供写文件。
+    // 适合"日志量极大、只需要事后看文件"的场景。
+    fileOnly: false,
+  };
+  window.__ccCfg = cfg;
+
   // 真实开销统计：累计所有在页面侧花掉的时间，供侧边栏读取。
-  // nativeMs 是原生 console 的耗时（没有插件也会发生），单独记，用于对比。
+  // nativeMs 是原生 console 的耗时（没有 DevTools 时接近 0，开着则可能很贵）。
   const stats = { lines: 0, describeMs: 0, flushMs: 0, nativeMs: 0 };
 
   const EMPTY_ARGS = [];
@@ -455,15 +468,15 @@ function mainWorldCapture() {
     // 用固定参数位而不是 rest（...args），避免每次调用都新建数组
     const wrapped = function (a0, a1, a2, a3, a4) {
       // 原生调用单独计时（这段不管有没有插件都会发生，不算我们的开销）
-      const tNative = performance.now();
-      if (orig) {
+      if (orig && !cfg.muteNative) {
+        const tNative = performance.now();
         try {
           orig.apply(console, arguments);
         } catch (e) {
           // 原生 console 出错不能影响页面
         }
+        stats.nativeMs += performance.now() - tNative;
       }
-      stats.nativeMs += performance.now() - tNative;
 
       // 这一段才是我们的采集开销
       const t0 = performance.now();
@@ -521,8 +534,12 @@ function mainWorldCapture() {
     for (let i = 0; i < 20; i++) {
       const batch = ringDrain(MAX_BATCH);
       if (!batch || batch.length === 0) break;
+
+      // 只落盘模式：批量攒成文本，通过一个轻量的字符串消息送出去，
+      // 不再走对象数组的结构化克隆（几万条时那个克隆才是真的贵）。
+      const payload = cfg.fileOnly ? formatBatchToText(batch) : { __ccBatch: true, batch };
       try {
-        window.postMessage({ __ccBatch: true, batch }, '*');
+        window.postMessage(cfg.fileOnly ? { __ccBatchText: payload } : payload, '*');
       } catch (err) {
         // postMessage 失败（理论上不会）时直接丢弃这一批，不重试堆积
         break;
@@ -530,6 +547,16 @@ function mainWorldCapture() {
       if (batch.length < MAX_BATCH) break;
     }
     stats.flushMs += performance.now() - t0;
+  }
+
+  // 把一批日志拼成多行文本（只落盘模式用），避免传对象数组
+  function formatBatchToText(batch) {
+    const out = new Array(batch.length);
+    for (let i = 0; i < batch.length; i++) {
+      const b = batch[i];
+      out[i] = '[' + new Date(b.time).toISOString() + '] [' + b.level + '] ' + b.text;
+    }
+    return out.join('\n') + '\n';
   }
 
   // 上报一次真实开销统计，并把窗口清零
@@ -552,8 +579,17 @@ function mainWorldCapture() {
 
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
-    if (event.data && event.data.__ccStatsRequest) {
+    const d = event.data;
+    if (!d) return;
+    if (d.__ccStatsRequest) {
       // 立刻上报一次，不等到下一个窗口
+      reportStats();
+      return;
+    }
+    // 侧边栏下发配置（静音模式等）
+    if (d.__ccSetConfig) {
+      if (typeof d.muteNative === 'boolean') cfg.muteNative = d.muteNative;
+      if (typeof d.fileOnly === 'boolean') cfg.fileOnly = d.fileOnly;
       reportStats();
     }
   });
@@ -587,6 +623,15 @@ function bridgeInject() {
       } catch (e) {
         // 扩展上下文失效（Extension context invalidated），静默忽略
       }
+      return;
+    }
+
+    // 只落盘模式：已经是拼好的文本，直接转发，不做结构化克隆
+    if (typeof data.__ccBatchText === 'string') {
+      try {
+        const p = chrome.runtime.sendMessage({ type: 'cc-log-text', text: data.__ccBatchText });
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch (e) {}
       return;
     }
 
@@ -659,10 +704,66 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (!msg) return;
   if (msg.type === 'cc-log-batch' && running) {
     appendBatch(msg.batch);
+  } else if (msg.type === 'cc-log-text' && running) {
+    appendTextBatch(msg.text);
   } else if (msg.type === 'cc-stats') {
     applyStats(msg.stats);
   }
 });
+
+// 把两个开关的当前状态下发给页面（改完立即生效，不需要重新注入）
+async function pushConfigToPage() {
+  if (targetTabId == null) return;
+  try {
+    const cfg = {
+      muteNative: muteNativeToggle.checked,
+      fileOnly: fileOnlyToggle.checked,
+    };
+    await chrome.scripting.executeScript({
+      target: { tabId: targetTabId },
+      world: 'MAIN',
+      func: (c) => window.postMessage({ __ccSetConfig: true, ...c }, '*'),
+      args: [cfg],
+    });
+  } catch (e) {
+    // 页面可能已关闭或还没注入，忽略
+  }
+}
+
+muteNativeToggle.addEventListener('change', pushConfigToPage);
+fileOnlyToggle.addEventListener('change', () => {
+  if (fileOnlyToggle.checked) {
+    setStatus('只落盘模式：日志不再显示在侧边栏，仅写入文件；已停止采集时可重新「开始」以获得干净的文件', 'running');
+  } else {
+    setStatus('已关闭只落盘模式', 'stopped');
+  }
+  pushConfigToPage();
+});
+
+// 只落盘模式：文本直接写文件，不建行对象、不进视图，也不计分类
+let textLinesWritten = 0;
+
+async function appendTextBatch(text) {
+  if (!text) return;
+  const lines = text.split('\n');
+  // 末尾会多一个空串，去掉
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  const n = lines.length;
+  if (n === 0) return;
+
+  textLinesWritten += n;
+  totalCount += n;
+  rateWindowCount += n;
+  updateLineCount();
+
+  if (writable) {
+    try {
+      await writable.write(text);
+    } catch (e) {
+      setStatus('写入本地文件失败：' + e.message, 'error');
+    }
+  }
+}
 
 // 累计页面侧真实开销，算出「每条日志在页面里花了多少微秒」
 let statsAccum = { lines: 0, describeMs: 0, flushMs: 0, nativeMs: 0 };
@@ -734,6 +835,7 @@ startBtn.addEventListener('click', async () => {
 
     await chrome.scripting.executeScript({ target: { tabId: targetTabId }, world: 'MAIN', func: mainWorldCapture });
     await chrome.scripting.executeScript({ target: { tabId: targetTabId }, func: bridgeInject });
+    await pushConfigToPage();
 
     // 新一次采集：重置计数和视图，避免和上一次的数据混在一起
     displayRows = [];
