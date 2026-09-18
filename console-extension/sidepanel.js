@@ -70,11 +70,11 @@ let rateTimer = null;
 let currentRate = 0;
 // 当前视图里的行：只保留最近 MAX_DISPLAY_ROWS 条
 let displayRows = [];
-// 每一行都带一个只增不减的 seq。用它来标记「视图已经渲染到哪一行了」，
-// 因为 displayRows 会被裁剪，用行数推算位置在裁剪后会算错（曾导致视图卡住不再更新）。
+// 每一行都带一个只增不减的 seq。视图的尾部锚点用它标记，
+// 因为 displayRows 会被裁剪，用行数推算位置在裁剪后会算错。
 let nextSeq = 0;
-// 视图里最后渲染的那一行。为 null 表示视图是空的 / 需要整体重建。
-let lastRenderedSeq = null;
+// 视图里最后渲染的那一行的 seq。null 表示视图需要整体重建。
+let appendCursor = null;
 // 渲染节流
 let renderTimer = null;
 let pendingRebuild = false;
@@ -247,8 +247,8 @@ function rebuildView() {
     frag.appendChild(createRowEl(row));
   }
   logViewEl.replaceChildren(frag);
-  // 记录视图渲染到了哪一行，后续增量追加以它为锚点
-  lastRenderedSeq = rows.length ? rows[rows.length - 1].seq : null;
+  // 重建后，视图的尾部锚点 = 这次渲染的最后一行
+  appendCursor = rows.length ? rows[rows.length - 1].seq : null;
   scrollToBottomIfNeeded();
   updateLineCount();
   updateFilterSummary();
@@ -263,9 +263,15 @@ function scheduleRender(rebuild) {
     pendingRebuild = false;
     if (doRebuild) {
       rebuildView();
-    } else {
-      appendNewRows();
+      return;
     }
+    // 兜底：节点数意外超过上限太多（正常不该发生），直接重建一次拉回边界，
+    // 避免节点无限累积到某次集中销毁时把页面拖死。
+    if (logViewEl.childElementCount > MAX_DISPLAY_ROWS * 2) {
+      rebuildView();
+      return;
+    }
+    appendNewRows();
   }, RENDER_THROTTLE_MS);
 }
 
@@ -283,14 +289,22 @@ function appendNewRows() {
   }
 
   // 视图还是空的，或者没有可用的锚点，就整体重建一次
-  if (lastRenderedSeq === null || displayRows.length === 0) {
+  if (appendCursor === null || displayRows.length === 0) {
     rebuildView();
     return;
   }
 
-  // 已经渲染到的那个 seq 可能因为视图裁剪被丢掉了，这种情况下也重建
-  const anchorIdx = displayRows.findIndex((r) => r.seq === lastRenderedSeq);
+  // 从尾部往前找锚点：正常情况下它就是倒数第一个或倒数第二个，很快命中。
+  // 不做"假设它在末尾"的捷径，那在数组被裁剪后会算错位置导致重复/漏渲染。
+  let anchorIdx = -1;
+  for (let i = displayRows.length - 1; i >= 0; i--) {
+    if (displayRows[i].seq === appendCursor) {
+      anchorIdx = i;
+      break;
+    }
+  }
   if (anchorIdx === -1) {
+    // 锚点已被裁掉，重建一次
     rebuildView();
     return;
   }
@@ -306,12 +320,10 @@ function appendNewRows() {
     frag.appendChild(createRowEl(row));
   }
   logViewEl.appendChild(frag);
-  lastRenderedSeq = rowsToAppend[rowsToAppend.length - 1].seq;
-
+  appendCursor = rowsToAppend[rowsToAppend.length - 1].seq;
   // DOM 节点数超过上限时，从头部删掉超出的部分。
-  // 不用去同步 lastRenderedSeq——它是尾部锚点，删头部不会影响它。
-  let renderedNow = logViewEl.childElementCount;
-  let excess = renderedNow - MAX_DISPLAY_ROWS;
+  // 这一步必须真的执行，否则节点会无限累积，直到某次重建时集中销毁而卡死。
+  let excess = logViewEl.childElementCount - MAX_DISPLAY_ROWS;
   while (excess > 0) {
     const el = logViewEl.firstChild;
     if (!el) break;
@@ -726,7 +738,7 @@ startBtn.addEventListener('click', async () => {
     // 新一次采集：重置计数和视图，避免和上一次的数据混在一起
     displayRows = [];
     nextSeq = 0;
-    lastRenderedSeq = null;
+    appendCursor = null;
     errorSummaryLines = [];
     errorSummaryTruncated = false;
     categoryCounts = { verbose: 0, info: 0, warnings: 0, errors: 0 };
@@ -809,7 +821,7 @@ changeDirBtn.addEventListener('click', async () => {
 clearBtn.addEventListener('click', () => {
   // 只清空视图，累计的统计数字和错误汇总保持不变
   displayRows = [];
-  lastRenderedSeq = null;
+  appendCursor = null;
   rebuildView();
 });
 
