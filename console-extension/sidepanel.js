@@ -22,6 +22,7 @@ const statChips = {
 const prevErrorBtn = document.getElementById('prevErrorBtn');
 const nextErrorBtn = document.getElementById('nextErrorBtn');
 const diagBtn = document.getElementById('diagBtn');
+const overheadEl = document.getElementById('overhead');
 
 // 视图里保留的最大行数。这个数字直接决定了侧边栏占多少内存和 DOM 节点数，
 // 不要调太大：每多一行就多一个常驻 DOM 节点，浏览器长时间运行会明显变卡。
@@ -67,8 +68,6 @@ let errorSummaryLines = [];
 let rateWindowCount = 0;
 let rateTimer = null;
 let currentRate = 0;
-// 自测结果的落点：由 runtime.onMessage 收到后调用
-let measureResolve = () => {};
 // 当前视图里的行：只保留最近 MAX_DISPLAY_ROWS 条
 let displayRows = [];
 // 每一行都带一个只增不减的 seq。用它来标记「视图已经渲染到哪一行了」，
@@ -181,6 +180,7 @@ function startRateTimer() {
     currentRate = rateWindowCount;
     rateWindowCount = 0;
     updateLineCount();
+    updateOverheadDisplay();
   }, 1000);
 }
 
@@ -425,7 +425,12 @@ function mainWorldCapture() {
     }
     if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT) + '…[已截断]';
     ringPush({ level, text, time: Date.now() });
+    stats.lines++;
   }
+
+  // 真实开销统计：累计所有在页面侧花掉的时间，供侧边栏读取。
+  // nativeMs 是原生 console 的耗时（没有插件也会发生），单独记，用于对比。
+  const stats = { lines: 0, describeMs: 0, flushMs: 0, nativeMs: 0 };
 
   const EMPTY_ARGS = [];
 
@@ -437,7 +442,19 @@ function mainWorldCapture() {
     if (orig.__ccWrapped) return;
     // 用固定参数位而不是 rest（...args），避免每次调用都新建数组
     const wrapped = function (a0, a1, a2, a3, a4) {
-      if (orig) orig.apply(console, arguments);
+      // 原生调用单独计时（这段不管有没有插件都会发生，不算我们的开销）
+      const tNative = performance.now();
+      if (orig) {
+        try {
+          orig.apply(console, arguments);
+        } catch (e) {
+          // 原生 console 出错不能影响页面
+        }
+      }
+      stats.nativeMs += performance.now() - tNative;
+
+      // 这一段才是我们的采集开销
+      const t0 = performance.now();
       try {
         const n = arguments.length;
         if (n === 0) {
@@ -450,6 +467,7 @@ function mainWorldCapture() {
       } catch (e) {
         // 采集过程绝不能影响页面本身
       }
+      stats.describeMs += performance.now() - t0;
     };
     wrapped.__ccWrapped = true;
     console[m] = wrapped;
@@ -485,61 +503,53 @@ function mainWorldCapture() {
 
   function flush() {
     if (!window.__ccRunning) return;
+    const t0 = performance.now();
     // 循环排空：每次最多搬 MAX_BATCH 条，避免单个巨型批次，
     // 但也不让日志在缓冲里积压（有上限保护，最多转几次就空了）。
     for (let i = 0; i < 20; i++) {
       const batch = ringDrain(MAX_BATCH);
-      if (!batch || batch.length === 0) return;
+      if (!batch || batch.length === 0) break;
       try {
         window.postMessage({ __ccBatch: true, batch }, '*');
       } catch (err) {
         // postMessage 失败（理论上不会）时直接丢弃这一批，不重试堆积
-        return;
+        break;
       }
-      if (batch.length < MAX_BATCH) return;
+      if (batch.length < MAX_BATCH) break;
     }
+    stats.flushMs += performance.now() - t0;
   }
 
-  // 采集开销自测：量一段真实的单条日志成本（describe + 环形缓冲写入），
-  // 结果发回侧边栏显示，用来判断是不是这段代码在吃页面 CPU。
-  function measureCost() {
-    const N = 20000;
-    const sample = [
-      'MainName关闭界面 UILogin goTo checkTaskJumpRes onTick render nextFrame update',
-      12345,
-      { a: 1, b: 2, c: 3 },
-      [1, 2, 3],
-    ];
-    const t0 = performance.now();
-    for (let i = 0; i < N; i++) {
-      const parts = new Array(sample.length);
-      for (let j = 0; j < sample.length; j++) parts[j] = describe(sample[j]);
-      ringPush({ level: 'log', text: parts.join(' '), time: 0 });
-    }
-    const elapsed = performance.now() - t0;
-    // 测完把这几万条塞进去的内容清掉，避免污染真实日志
-    ringLen = 0;
-    ringHead = 0;
-    return (elapsed / N) * 1000; // 返回 µs/条
+  // 上报一次真实开销统计，并把窗口清零
+  function reportStats() {
+    const s = {
+      lines: stats.lines,
+      describeMs: stats.describeMs,
+      flushMs: stats.flushMs,
+      nativeMs: stats.nativeMs,
+    };
+    stats.lines = 0;
+    stats.describeMs = 0;
+    stats.flushMs = 0;
+    stats.nativeMs = 0;
+    if (s.lines === 0 && s.flushMs === 0 && s.nativeMs === 0) return;
+    try {
+      window.postMessage({ __ccStats: s }, '*');
+    } catch (e) {}
   }
 
-  // 侧边栏请求自测时回一个结果
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
-    if (event.data && event.data.__ccMeasureRequest) {
-      let us = -1;
-      try {
-        us = measureCost();
-      } catch (e) {
-        us = -1;
-      }
-      try {
-        window.postMessage({ __ccMeasureResult: us }, '*');
-      } catch (e) {}
+    if (event.data && event.data.__ccStatsRequest) {
+      // 立刻上报一次，不等到下一个窗口
+      reportStats();
     }
   });
 
-  setInterval(flush, FLUSH_MS);
+  setInterval(() => {
+    flush();
+    reportStats();
+  }, FLUSH_MS);
 
   // 页面切到后台时 setInterval 会被浏览器节流到一分钟一次，
   // 这里在切后台/切回来的时机补一次排空，避免缓冲区在后台堆积。
@@ -568,10 +578,10 @@ function bridgeInject() {
       return;
     }
 
-    // 自测结果：转发给侧边栏（侧边栏和页面不是同一个 window，收不到页面自己发的消息）
-    if (typeof data.__ccMeasureResult === 'number') {
+    // 真实开销统计：转发给侧边栏
+    if (data.__ccStats) {
       try {
-        const p = chrome.runtime.sendMessage({ type: 'cc-measure-result', us: data.__ccMeasureResult });
+        const p = chrome.runtime.sendMessage({ type: 'cc-stats', stats: data.__ccStats });
         if (p && typeof p.catch === 'function') p.catch(() => {});
       } catch (e) {}
     }
@@ -637,10 +647,43 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (!msg) return;
   if (msg.type === 'cc-log-batch' && running) {
     appendBatch(msg.batch);
-  } else if (msg.type === 'cc-measure-result') {
-    measureResolve(msg.us);
+  } else if (msg.type === 'cc-stats') {
+    applyStats(msg.stats);
   }
 });
+
+// 累计页面侧真实开销，算出「每条日志在页面里花了多少微秒」
+let statsAccum = { lines: 0, describeMs: 0, flushMs: 0, nativeMs: 0 };
+let statsSince = Date.now();
+
+function applyStats(s) {
+  if (!s) return;
+  statsAccum.lines += s.lines || 0;
+  statsAccum.describeMs += s.describeMs || 0;
+  statsAccum.flushMs += s.flushMs || 0;
+  statsAccum.nativeMs += s.nativeMs || 0;
+  updateOverheadDisplay();
+}
+
+function updateOverheadDisplay() {
+  if (!running) return;
+  const elapsedSec = (Date.now() - statsSince) / 1000;
+  if (elapsedSec < 1) return;
+  const mineMs = statsAccum.describeMs + statsAccum.flushMs;
+  const lines = statsAccum.lines;
+  const perLineUs = lines > 0 ? (mineMs / lines) * 1000 : 0;
+  const minePct = (mineMs / (elapsedSec * 1000)) * 100;
+  const nativePct = (statsAccum.nativeMs / (elapsedSec * 1000)) * 100;
+  overheadEl.textContent =
+    `页面侧开销：插件 ${perLineUs.toFixed(2)} µs/条，占主线程 ${minePct.toFixed(2)}%；` +
+    `原生 console 占 ${nativePct.toFixed(2)}%（${lines} 条 / ${elapsedSec.toFixed(0)}s）`;
+}
+
+function resetStats() {
+  statsAccum = { lines: 0, describeMs: 0, flushMs: 0, nativeMs: 0 };
+  statsSince = Date.now();
+  overheadEl.textContent = '页面侧开销：统计中…';
+}
 
 // ---------- 开始 / 停止 ----------
 async function ensureDirHandle() {
@@ -697,6 +740,7 @@ startBtn.addEventListener('click', async () => {
     stopBtn.disabled = false;
     changeDirBtn.disabled = true;
     startRateTimer();
+    resetStats();
     setStatus(`采集中 → ${fileHandle.name}`, 'running');
   } catch (e) {
     setStatus('开始失败：' + e.message, 'error');
@@ -769,48 +813,24 @@ clearBtn.addEventListener('click', () => {
   rebuildView();
 });
 
-// ---------- 自测：量页面侧每条日志的真实开销 ----------
+// ---------- 实时开销显示：直接读页面侧统计，不用假样本 ----------
 diagBtn.addEventListener('click', async () => {
   if (targetTabId == null) {
-    setStatus('请先点「开始」选定一个目标标签页，再自测', 'error');
+    setStatus('请先点「开始」选定一个目标标签页', 'error');
     return;
   }
-  setStatus('正在自测…（会在目标页面里跑 2 万次采集逻辑，约一两秒）', 'running');
-
-  const result = await new Promise((resolve) => {
-    let done = false;
-    const finish = (v) => {
-      if (done) return;
-      done = true;
-      resolve(v);
-    };
-    measureResolve = (us) => finish(us);
-
-    chrome.scripting
-      .executeScript({
-        target: { tabId: targetTabId },
-        func: () => window.postMessage({ __ccMeasureRequest: true }, '*'),
-      })
-      .catch(() => finish(-1));
-
-    setTimeout(() => finish(-1), 8000);
-  });
-
-  measureResolve = () => {};
-
-  if (result === null || result < 0) {
-    setStatus('自测没有拿到结果（页面里可能还没注入采集脚本，请先点「开始」并刷新页面）', 'error');
+  // 请求页面立刻上报一次这段时间的真实开销
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: targetTabId },
+      func: () => window.postMessage({ __ccStatsRequest: true }, '*'),
+    });
+  } catch (e) {
+    setStatus('读取开销失败：' + e.message, 'error');
     return;
   }
-
-  const perLineUs = result;
-  const at100 = (perLineUs * 100) / 1000; // 100 条/秒时，每秒占用主线程的毫秒数
-  setStatus(
-    `自测结果：每条日志在页面里约 ${perLineUs.toFixed(2)} µs\n` +
-      `按 100 条/秒 估算：约 ${at100.toFixed(2)} ms/秒，占主线程 ${(at100 / 10).toFixed(2)}%\n` +
-      `当前实际速率：${currentRate} 条/秒`,
-    'running'
-  );
+  updateOverheadDisplay();
+  setStatus('已刷新开销统计（数据来自页面里真实发生的日志处理）', 'running');
 });
 
 // ---------- 级别筛选 / 搜索 / 合并 ----------
