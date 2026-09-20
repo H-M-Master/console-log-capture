@@ -82,6 +82,10 @@ function updateDiagDisplay(result, changed) {
     `插件占 ${s.avgPluginPct.toFixed(2)}%｜原生 ${s.avgNativePct.toFixed(1)}%｜DOM ${s.maxDom}｜积压 ${s.maxBacklog}`;
   if (result.reasons.length) text += '\n⚠ ' + result.reasons.join('；');
   if (changed && changed.length) text += '\n✓ ' + changed.join('；');
+  if (lastLongTaskNote) text += '\n⚠ ' + lastLongTaskNote;
+  if (lastSelfCheck && !lastSelfCheck.stillOurs && lastSelfCheck.running) {
+    text += '\n⚠ console.log 已被页面替换，采集可能拦不到日志（静音会失效）';
+  }
   if (diagFileNote) text += '\n诊断文件：' + diagFileNote;
   diagInfoEl.textContent = text;
 }
@@ -121,6 +125,8 @@ function startDiagHeartbeat() {
 
 // 读取页面侧自检信息并记录；发现异常自动处理
 let lastWrapperDepth = 0;
+let lastSelfCheck = null;
+let lastLongTaskNote = '';
 
 async function runSelfCheck() {
   if (targetTabId == null) return;
@@ -133,8 +139,30 @@ async function runSelfCheck() {
     if (!info) return;
 
     lastWrapperDepth = info.wrapperDepth;
+    lastSelfCheck = info;
     if (diagWriter) {
       diagWriter.enqueue({ kind: 'selfcheck', at: new Date().toISOString(), ...info });
+    }
+
+    // 长任务：页面主线程被阻塞超过 50ms 的任务（含 V8 垃圾回收）。
+    // 这是"我的计时器测不到、但页面的确在卡"的主要来源。
+    const lt = info.longTask;
+    if (lt && lt.count > 0) {
+      const msg = `页面主线程被阻塞 ${lt.count} 次，累计 ${lt.totalMs}ms，最长 ${lt.maxMs}ms（采集期间）`;
+      diagLog(msg);
+      // 长任务很严重的记录到自检摘要里
+      if (lt.totalMs > 1000) {
+        lastLongTaskNote = msg;
+      }
+    }
+
+    // 被顶替检测：如果 console.log 已经不是我的包装层，说明引擎或其他脚本
+    // 在页面初始化时（我注入之后）把它换掉了。这时"静音"是无效的，
+    // 因为日志根本不再经过我的代码。
+    if (!info.stillOurs && info.running) {
+      const msg = '警告：console.log 已被页面/引擎替换，当前采集可能拦不到日志（静音也会失效）';
+      diagLog(msg);
+      setStatus(msg, 'error');
     }
 
     // 叠包检测：正常应该是 1 层。超过说明注入逻辑被破坏了。
@@ -740,16 +768,43 @@ function mainWorldCapture() {
     return depth;
   }
 
+  // 采集长任务：主线程被阻塞超过 50ms 的任务。
+  // 这是"我测不到但确实卡"的主要来源——比如 V8 垃圾回收、
+  // 或页面自己做的重活。性能观察器能直接抓到，不依赖我的计时器。
+  const longTasks = { count: 0, totalMs: 0, maxMs: 0 };
+  try {
+    if (typeof PerformanceObserver === 'function') {
+      const po = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          longTasks.count++;
+          longTasks.totalMs += e.duration;
+          if (e.duration > longTasks.maxMs) longTasks.maxMs = e.duration;
+        }
+      });
+      po.observe({ entryTypes: ['longtask'] });
+    }
+  } catch (e) {
+    // 不支持 longtask 就跳过，不影响采集
+  }
+
   // 暴露给侧边栏读取的自检信息
   window.__ccSelfCheck = function () {
+    // 检查 console.log 是否还是我的包装层（可能被引擎顶替了）
+    const stillOurs = !!(console.log && console.log.__ccWrapped);
+    const lt = { count: longTasks.count, totalMs: Math.round(longTasks.totalMs), maxMs: Math.round(longTasks.maxMs) };
+    longTasks.count = 0;
+    longTasks.totalMs = 0;
+    longTasks.maxMs = 0;
     return {
       installed: !!window.__ccInstalled,
       running: !!window.__ccRunning,
       wrapperDepth: countWrappers(),
+      stillOurs,
       ringLen: ringLen,
       ringCap: MAX_BUFFER,
       bridgeInstalled: !!window.__ccBridgeInstalled,
       intervalCount: window.__ccIntervalCount || 0,
+      longTask: lt,
     };
   };
 
@@ -899,15 +954,47 @@ async function appendBatch(batch) {
   scheduleRender(false);
 
   if (writable) {
-    const tw = performance.now();
-    try {
-      await writable.write(fileLines.join('\n') + '\n');
-    } catch (e) {
-      setStatus('写入本地文件失败：' + e.message, 'error');
-      diagLog('写入本地文件失败：' + e.message);
-    }
-    collector.addWrite(performance.now() - tw);
+    enqueueWrite(fileLines.join('\n') + '\n');
   }
+}
+
+// ---------- 落盘：攒批写入，避免高频小写入造成 I/O 尖峰 ----------
+// 实测发现每 300ms 写一次小批量时，偶尔会出现 300~400ms 的写入阻塞，
+// 那个窗口的 CPU 占用会从 1% 跳到 7~10%。改成攒量/攒时再写，把尖峰摊平。
+const WRITE_BATCH_BYTES = 64 * 1024; // 攒够 64KB 就写
+const WRITE_FLUSH_MS = 1000; // 或者最多等 1 秒
+let pendingWriteChunks = [];
+let pendingWriteBytes = 0;
+let writeFlushTimer = null;
+
+function enqueueWrite(text) {
+  pendingWriteChunks.push(text);
+  pendingWriteBytes += text.length;
+  if (pendingWriteBytes >= WRITE_BATCH_BYTES) {
+    flushWrite();
+    return;
+  }
+  if (!writeFlushTimer) {
+    writeFlushTimer = setTimeout(() => {
+      writeFlushTimer = null;
+      flushWrite();
+    }, WRITE_FLUSH_MS);
+  }
+}
+
+async function flushWrite() {
+  if (!writable || pendingWriteChunks.length === 0) return;
+  const payload = pendingWriteChunks.join('');
+  pendingWriteChunks = [];
+  pendingWriteBytes = 0;
+  const tw = performance.now();
+  try {
+    await writable.write(payload);
+  } catch (e) {
+    setStatus('写入本地文件失败：' + e.message, 'error');
+    diagLog('写入本地文件失败：' + e.message);
+  }
+  collector.addWrite(performance.now() - tw);
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
@@ -967,14 +1054,7 @@ async function appendTextBatch(text) {
   updateLineCount();
 
   if (writable) {
-    const tw = performance.now();
-    try {
-      await writable.write(text);
-    } catch (e) {
-      setStatus('写入本地文件失败：' + e.message, 'error');
-      diagLog('写入本地文件失败（只落盘模式）：' + e.message);
-    }
-    collector.addWrite(performance.now() - tw);
+    enqueueWrite(text);
   }
 }
 
@@ -1043,6 +1123,10 @@ async function startDiagWriter(handle) {
     diagFileNote = name;
     diagLog('采集开始');
     diagLog(`阈值：${JSON.stringify(window.CCDiag.THRESHOLDS)}`);
+    diagLog(
+      `配置：静音=${muteNativeToggle.checked} 只落盘=${fileOnlyToggle.checked} ` +
+        `视图上限=${MAX_DISPLAY_ROWS} 页面缓冲上限=2000 单批=500`
+    );
   } catch (e) {
     diagWriter = null;
     diagFileNote = '(诊断文件创建失败：' + e.message + ')';
@@ -1112,6 +1196,13 @@ async function stopCapture(reason) {
     clearTimeout(renderTimer);
     renderTimer = null;
   }
+
+  // 关文件前必须先把攒着的日志全写下去，否则会丢最后一批
+  if (writeFlushTimer) {
+    clearTimeout(writeFlushTimer);
+    writeFlushTimer = null;
+  }
+  await flushWrite();
 
   // 收尾诊断文件：把最后一段窗口和结论也记下来
   if (diagWriter) {
