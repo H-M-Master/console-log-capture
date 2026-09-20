@@ -25,6 +25,172 @@ const diagBtn = document.getElementById('diagBtn');
 const overheadEl = document.getElementById('overhead');
 const muteNativeToggle = document.getElementById('muteNativeToggle');
 const fileOnlyToggle = document.getElementById('fileOnlyToggle');
+const diagInfoEl = document.getElementById('diagInfo');
+
+// ---------- 自动诊断 ----------
+// 插件自己采集指标、自己判断异常、自己降级，不依赖人工观察。
+const collector = new window.CCDiag.MetricsCollector();
+let diagWriter = null;
+let diagTimer = null;
+let diagFileNote = '';
+// 自动降级动作只做一次，避免反复切来切去
+const autoActions = { mutedNative: false, forcedFileOnly: false, clampedView: false };
+
+function diagLog(text) {
+  if (diagWriter) diagWriter.note(text);
+}
+
+// 自动降级：这是"不需要人工判断"的关键——发现问题就直接动手
+async function autoRemediate(result) {
+  const changed = [];
+
+  // 对策 1：原生 console 太贵 → 自动静音
+  if (!autoActions.mutedNative && result.stats.avgNativePct > 40) {
+    autoActions.mutedNative = true;
+    muteNativeToggle.checked = true;
+    await pushConfigToPage();
+    changed.push('已自动开启静音（原生 console 开销过高）');
+  }
+
+  // 对策 2：插件本身占主线程过多 → 自动切只落盘
+  if (!autoActions.forcedFileOnly && result.stats.avgPluginPct > 15) {
+    autoActions.forcedFileOnly = true;
+    fileOnlyToggle.checked = true;
+    await pushConfigToPage();
+    changed.push('已自动切换为只落盘（采集本身占用过高）');
+  }
+
+  // 对策 3：视图出问题 → 自动收紧视图上限并重建
+  if (!autoActions.clampedView && result.stats.maxDom > 4000) {
+    autoActions.clampedView = true;
+    rebuildView();
+    changed.push('已自动重建视图（DOM 节点数异常）');
+  }
+
+  if (changed.length > 0) {
+    setStatus('自动降级：' + changed.join('；'), 'running');
+    diagLog('自动降级：' + changed.join('；'));
+    updateDiagDisplay(result, changed);
+  }
+}
+
+function updateDiagDisplay(result, changed) {
+  const s = result.stats;
+  const level = result.level === 'severe' ? '严重' : result.level === 'warn' ? '注意' : '正常';
+  let text =
+    `自检[${level}] 速率 ${s.avgRate.toFixed(0)}/s｜采集 ${s.avgPerLine.toFixed(1)}µs/条｜` +
+    `插件占 ${s.avgPluginPct.toFixed(2)}%｜原生 ${s.avgNativePct.toFixed(1)}%｜DOM ${s.maxDom}｜积压 ${s.maxBacklog}`;
+  if (result.reasons.length) text += '\n⚠ ' + result.reasons.join('；');
+  if (changed && changed.length) text += '\n✓ ' + changed.join('；');
+  if (diagFileNote) text += '\n诊断文件：' + diagFileNote;
+  diagInfoEl.textContent = text;
+}
+
+// 心跳：每秒采样一次、每 5 秒结算一次并做诊断。
+// 整个过程自动完成，不需要人工观察。
+function startDiagHeartbeat() {
+  stopDiagHeartbeat();
+  diagTimer = setInterval(async () => {
+    // 采集环境指标
+    if (performance.memory) {
+      collector.setHeap(performance.memory.usedJSHeapSize / 1048576);
+    }
+    collector.setVisible(document.visibilityState === 'visible');
+
+    diagSampleCount++;
+
+    // 每 5 秒做一次页面侧自检：主要看 console 是否被叠包了多层。
+    // 游戏热重载后如果叠包了，日志会被重复序列化多次，这是隐藏的性能杀手。
+    if (diagSampleCount % 5 === 0) {
+      await runSelfCheck();
+    } else {
+      return;
+    }
+
+    const sample = collector.flush();
+    if (diagWriter) diagWriter.sample(sample);
+
+    const result = collector.diagnose(5);
+    updateDiagDisplay(result);
+    if (result.level !== 'ok') {
+      if (diagWriter) diagWriter.note(`异常：${result.reasons.join('；')}`);
+      autoRemediate(result);
+    }
+  }, 1000);
+}
+
+// 读取页面侧自检信息并记录；发现异常自动处理
+let lastWrapperDepth = 0;
+
+async function runSelfCheck() {
+  if (targetTabId == null) return;
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: targetTabId },
+      func: () => (typeof window.__ccSelfCheck === 'function' ? window.__ccSelfCheck() : null),
+    });
+    const info = res && res.result;
+    if (!info) return;
+
+    lastWrapperDepth = info.wrapperDepth;
+    if (diagWriter) {
+      diagWriter.enqueue({ kind: 'selfcheck', at: new Date().toISOString(), ...info });
+    }
+
+    // 叠包检测：正常应该是 1 层。超过说明注入逻辑被破坏了。
+    if (info.wrapperDepth > 1) {
+      const msg = `检测到 console 被叠包 ${info.wrapperDepth} 层（应为 1 层），日志会被重复处理，正在修复`;
+      setStatus(msg, 'error');
+      diagLog(msg);
+      await repairWrapper();
+    }
+  } catch (e) {
+    // 标签页可能已关闭或还在加载，忽略
+  }
+}
+
+// 修复叠包：把包装层全部拆掉，重新注入一次干净的
+async function repairWrapper() {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: targetTabId },
+      world: 'MAIN',
+      func: () => {
+        // 沿 __ccOrig 链回溯到真正的原生函数，然后恢复
+        const methods = ['log', 'warn', 'error', 'info', 'debug'];
+        for (const m of methods) {
+          let fn = console[m];
+          let guard = 0;
+          while (typeof fn === 'function' && fn.__ccWrapped && fn.__ccOrig && guard < 50) {
+            fn = fn.__ccOrig;
+            guard++;
+          }
+          if (typeof fn === 'function') console[m] = fn;
+        }
+        // 清掉安装标记，让下次注入重新装一层干净的
+        window.__ccInstalled = false;
+        window.__ccRunning = false;
+      },
+    });
+    // 重新注入
+    await chrome.scripting.executeScript({ target: { tabId: targetTabId }, world: 'MAIN', func: mainWorldCapture });
+    await pushConfigToPage();
+    diagLog('已修复 console 叠包，重新注入完成');
+    setStatus('已修复 console 叠包（重新注入完成）', 'running');
+  } catch (e) {
+    diagLog('修复叠包失败：' + e.message);
+  }
+}
+
+
+function stopDiagHeartbeat() {
+  if (diagTimer) {
+    clearInterval(diagTimer);
+    diagTimer = null;
+  }
+}
+
+let diagSampleCount = 0;
 
 // 视图里保留的最大行数。这个数字直接决定了侧边栏占多少内存和 DOM 节点数，
 // 不要调太大：每多一行就多一个常驻 DOM 节点，浏览器长时间运行会明显变卡。
@@ -263,17 +429,25 @@ function scheduleRender(rebuild) {
     renderTimer = null;
     const doRebuild = pendingRebuild;
     pendingRebuild = false;
-    if (doRebuild) {
-      rebuildView();
-      return;
+
+    // 计时：诊断用，看渲染是否吃掉大量主线程
+    const t0 = performance.now();
+    try {
+      if (doRebuild) {
+        rebuildView();
+        return;
+      }
+      // 兜底：节点数意外超过上限太多（正常不该发生），直接重建一次拉回边界，
+      // 避免节点无限累积到某次集中销毁时把页面拖死。
+      if (logViewEl.childElementCount > MAX_DISPLAY_ROWS * 2) {
+        diagLog(`渲染兜底触发：DOM 节点 ${logViewEl.childElementCount} 超过上限两倍，强制重建`);
+        rebuildView();
+        return;
+      }
+      appendNewRows();
+    } finally {
+      collector.addRender(performance.now() - t0, logViewEl.childElementCount);
     }
-    // 兜底：节点数意外超过上限太多（正常不该发生），直接重建一次拉回边界，
-    // 避免节点无限累积到某次集中销毁时把页面拖死。
-    if (logViewEl.childElementCount > MAX_DISPLAY_ROWS * 2) {
-      rebuildView();
-      return;
-    }
-    appendNewRows();
   }, RENDER_THROTTLE_MS);
 }
 
@@ -495,6 +669,7 @@ function mainWorldCapture() {
       stats.describeMs += performance.now() - t0;
     };
     wrapped.__ccWrapped = true;
+    wrapped.__ccOrig = orig; // 保留原始引用，便于自检回溯包装层数
     console[m] = wrapped;
   });
 
@@ -549,6 +724,35 @@ function mainWorldCapture() {
     stats.flushMs += performance.now() - t0;
   }
 
+  // 自检：检查 console 是否被叠包了多层。
+  // 游戏热重载/重新编译后，我的"只装一次"标记可能失效，
+  // 导致同一条日志被序列化多次——这是最隐蔽的性能杀手。
+  function countWrappers() {
+    let depth = 0;
+    let fn = console.log;
+    const seen = new Set();
+    while (typeof fn === 'function' && fn.__ccWrapped && !seen.has(fn)) {
+      seen.add(fn);
+      depth++;
+      fn = fn.__ccOrig; // 需要包装时保存原始函数引用才能回溯
+      if (!fn) break;
+    }
+    return depth;
+  }
+
+  // 暴露给侧边栏读取的自检信息
+  window.__ccSelfCheck = function () {
+    return {
+      installed: !!window.__ccInstalled,
+      running: !!window.__ccRunning,
+      wrapperDepth: countWrappers(),
+      ringLen: ringLen,
+      ringCap: MAX_BUFFER,
+      bridgeInstalled: !!window.__ccBridgeInstalled,
+      intervalCount: window.__ccIntervalCount || 0,
+    };
+  };
+
   // 把一批日志拼成多行文本（只落盘模式用），避免传对象数组
   function formatBatchToText(batch) {
     const out = new Array(batch.length);
@@ -566,6 +770,8 @@ function mainWorldCapture() {
       describeMs: stats.describeMs,
       flushMs: stats.flushMs,
       nativeMs: stats.nativeMs,
+      backlog: ringLen, // 当前缓冲积压量，用于判断搬运是否跟不上
+      wrapperDepth: countWrappers(),
     };
     stats.lines = 0;
     stats.describeMs = 0;
@@ -598,6 +804,7 @@ function mainWorldCapture() {
     flush();
     reportStats();
   }, FLUSH_MS);
+  window.__ccIntervalCount = (window.__ccIntervalCount || 0) + 1;
 
   // 页面切到后台时 setInterval 会被浏览器节流到一分钟一次，
   // 这里在切后台/切回来的时机补一次排空，避免缓冲区在后台堆积。
@@ -692,11 +899,14 @@ async function appendBatch(batch) {
   scheduleRender(false);
 
   if (writable) {
+    const tw = performance.now();
     try {
       await writable.write(fileLines.join('\n') + '\n');
     } catch (e) {
       setStatus('写入本地文件失败：' + e.message, 'error');
+      diagLog('写入本地文件失败：' + e.message);
     }
+    collector.addWrite(performance.now() - tw);
   }
 }
 
@@ -757,11 +967,14 @@ async function appendTextBatch(text) {
   updateLineCount();
 
   if (writable) {
+    const tw = performance.now();
     try {
       await writable.write(text);
     } catch (e) {
       setStatus('写入本地文件失败：' + e.message, 'error');
+      diagLog('写入本地文件失败（只落盘模式）：' + e.message);
     }
+    collector.addWrite(performance.now() - tw);
   }
 }
 
@@ -775,6 +988,7 @@ function applyStats(s) {
   statsAccum.describeMs += s.describeMs || 0;
   statsAccum.flushMs += s.flushMs || 0;
   statsAccum.nativeMs += s.nativeMs || 0;
+  collector.addPageStats(s);
   updateOverheadDisplay();
 }
 
@@ -817,6 +1031,24 @@ async function ensureDirHandle() {
   return handle;
 }
 
+// 启动诊断写入器。诊断文件用 .jsonl（每行一个 JSON），便于事后分析。
+async function startDiagWriter(handle) {
+  try {
+    if (diagWriter) {
+      await diagWriter.close();
+      diagWriter = null;
+    }
+    diagWriter = new window.CCDiag.DiagWriter(handle);
+    const name = await diagWriter.open();
+    diagFileNote = name;
+    diagLog('采集开始');
+    diagLog(`阈值：${JSON.stringify(window.CCDiag.THRESHOLDS)}`);
+  } catch (e) {
+    diagWriter = null;
+    diagFileNote = '(诊断文件创建失败：' + e.message + ')';
+  }
+}
+
 startBtn.addEventListener('click', async () => {
   try {
     const tab = await getActiveTab();
@@ -832,6 +1064,9 @@ startBtn.addEventListener('click', async () => {
     currentSessionTs = new Date().toISOString().replace(/[:.]/g, '-');
     const fileHandle = await handle.getFileHandle(`console-log-${currentSessionTs}.txt`, { create: true });
     writable = await fileHandle.createWritable({ keepExistingData: false });
+
+    // 诊断文件也写到同一个目录（用户自己选的，通常不是 Cocos 项目内）
+    await startDiagWriter(handle);
 
     await chrome.scripting.executeScript({ target: { tabId: targetTabId }, world: 'MAIN', func: mainWorldCapture });
     await chrome.scripting.executeScript({ target: { tabId: targetTabId }, func: bridgeInject });
@@ -855,6 +1090,7 @@ startBtn.addEventListener('click', async () => {
     changeDirBtn.disabled = true;
     startRateTimer();
     resetStats();
+    startDiagHeartbeat();
     setStatus(`采集中 → ${fileHandle.name}`, 'running');
   } catch (e) {
     setStatus('开始失败：' + e.message, 'error');
@@ -864,6 +1100,7 @@ startBtn.addEventListener('click', async () => {
 async function stopCapture(reason) {
   running = false;
   stopRateTimer();
+  stopDiagHeartbeat();
   if (targetTabId != null) {
     try {
       await chrome.scripting.executeScript({ target: { tabId: targetTabId }, world: 'MAIN', func: stopMainWorld });
@@ -875,6 +1112,20 @@ async function stopCapture(reason) {
     clearTimeout(renderTimer);
     renderTimer = null;
   }
+
+  // 收尾诊断文件：把最后一段窗口和结论也记下来
+  if (diagWriter) {
+    try {
+      const finalSample = collector.flush();
+      diagWriter.sample(finalSample);
+      diagWriter.note('采集结束');
+      await diagWriter.close();
+    } catch (e) {
+      // 忽略
+    }
+    diagWriter = null;
+  }
+
   if (writable) {
     try {
       await writable.close();
@@ -908,6 +1159,27 @@ async function stopCapture(reason) {
 }
 
 stopBtn.addEventListener('click', () => stopCapture('已停止'));
+
+// ---------- 自动检测页面被重新加载/重新编译 ----------
+// 游戏热重载或 Cocos 重新编译会让页面重新加载，注入的脚本随之消失，
+// 采集会静默停止、日志看起来"卡住"。这里自动发现并自动重新注入。
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (tabId !== targetTabId || !running) return;
+  if (changeInfo.status !== 'complete') return;
+  const msg = '检测到目标页面重新加载（可能是游戏重新编译），正在自动重新注入采集脚本';
+  setStatus(msg, 'running');
+  diagLog(msg);
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: mainWorldCapture });
+    await chrome.scripting.executeScript({ target: { tabId }, func: bridgeInject });
+    await pushConfigToPage();
+    diagLog('重新注入完成，采集继续');
+    setStatus('页面重载后已自动恢复采集', 'running');
+  } catch (e) {
+    diagLog('重新注入失败：' + e.message);
+    setStatus('页面重载后重新注入失败：' + e.message, 'error');
+  }
+});
 
 changeDirBtn.addEventListener('click', async () => {
   try {
