@@ -23,6 +23,7 @@ const THRESHOLDS = {
   nativePercent: 20, // 原生 console 占主线程超过 20% 说明它在吃 CPU
   domNodes: 4000, // 视图 DOM 节点数上限（正常应 <= 2000）
   backlog: 1500, // 页面侧缓冲积压超过这个数说明搬运跟不上
+  writePercent: 15, // 落盘占每秒时间超过 15% 说明写得太频繁
 };
 
 /**
@@ -40,6 +41,9 @@ class MetricsCollector {
       nativeMs: 0,
       flushMs: 0,
       writeMs: 0,
+      writeCalls: 0,
+      writeBytes: 0,
+      maxWriteMs: 0,
       renderMs: 0,
       renderCount: 0,
       domNodes: 0,
@@ -48,6 +52,7 @@ class MetricsCollector {
       visible: true,
       startedAt: Date.now(),
     };
+    this.writeCallSamples = [];
     this.samples = [];
   }
 
@@ -70,6 +75,15 @@ class MetricsCollector {
 
   addWrite(ms) {
     this.window.writeMs += ms;
+  }
+
+  // 记录一次写入调用的开销，用来区分"调用次数"和"数据量"哪个才是成本来源
+  addWriteCall(ms, bytes) {
+    this.window.writeCalls++;
+    this.window.writeBytes += bytes || 0;
+    if (ms > this.window.maxWriteMs) this.window.maxWriteMs = ms;
+    this.writeCallSamples.push({ ms: Number(ms.toFixed(1)), bytes });
+    if (this.writeCallSamples.length > 100) this.writeCallSamples.shift();
   }
 
   setHeap(mb) {
@@ -95,6 +109,11 @@ class MetricsCollector {
       nativeMs: Number(w.nativeMs.toFixed(2)),
       flushMs: Number(w.flushMs.toFixed(2)),
       writeMs: Number(w.writeMs.toFixed(2)),
+      writeCalls: w.writeCalls,
+      writeBytes: w.writeBytes,
+      maxWriteMs: Number(w.maxWriteMs.toFixed(1)),
+      // 单次写入调用平均耗时：用来判断成本是否集中在"调用次数"上
+      perWriteMs: w.writeCalls > 0 ? Number((w.writeMs / w.writeCalls).toFixed(1)) : 0,
       renderMs: Number(w.renderMs.toFixed(2)),
       renderCount: w.renderCount,
       domNodes: w.domNodes,
@@ -121,6 +140,9 @@ class MetricsCollector {
       nativeMs: 0,
       flushMs: 0,
       writeMs: 0,
+      writeCalls: 0,
+      writeBytes: 0,
+      maxWriteMs: 0,
       renderMs: 0,
       renderCount: 0,
       domNodes: this.window.domNodes,
@@ -145,6 +167,10 @@ class MetricsCollector {
     const avgPerLine = avg('perLineUs');
     const avgNativePct = avg('nativePct');
     const avgPluginPct = avg('pluginPct');
+    const avgWriteMs = avg('writeMs');
+    const avgWritePct = (avgWriteMs / 1000) * 100; // 每秒写入耗时（样本窗口为 1 秒）
+    const avgPerWriteMs = avg('perWriteMs');
+    const avgWriteCalls = avg('writeCalls');
     const maxDom = Math.max(...recent.map((s) => s.domNodes));
     const maxBacklog = Math.max(...recent.map((s) => s.backlog));
     const avgRate = avg('rate');
@@ -162,6 +188,14 @@ class MetricsCollector {
     if (avgPluginPct > 5) {
       reasons.push(`插件累计占主线程 ${avgPluginPct.toFixed(2)}%（阈值 5%）`);
     }
+    // 落盘开销：这是实测中最贵的一环。每次 write() 的固定成本可达数百毫秒，
+    // 成本主要在调用次数上，所以要同时看"耗时占比"和"单次耗时"。
+    if (avgWritePct > THRESHOLDS.writePercent) {
+      reasons.push(
+        `落盘占每秒 ${avgWritePct.toFixed(0)}%（阈值 ${THRESHOLDS.writePercent}%），` +
+          `每秒 ${avgWriteCalls.toFixed(1)} 次调用、单次 ${avgPerWriteMs.toFixed(0)}ms`
+      );
+    }
     if (maxDom > THRESHOLDS.domNodes) {
       reasons.push(`视图 DOM 节点数 ${maxDom}（阈值 ${THRESHOLDS.domNodes}）`);
     }
@@ -174,10 +208,25 @@ class MetricsCollector {
 
     let level = 'ok';
     if (reasons.length > 0) level = 'warn';
-    // 严重：原生 console 很贵，或插件本身占主线程很多
-    if (avgNativePct > 40 || avgPluginPct > 15 || maxBacklog > 3000) level = 'severe';
+    // 严重：原生 console 很贵、插件占主线程很多、积压严重，或落盘吃掉了大半秒
+    if (avgNativePct > 40 || avgPluginPct > 15 || maxBacklog > 3000 || avgWritePct > 50) level = 'severe';
 
-    return { level, reasons, stats: { avgPerLine, avgNativePct, avgPluginPct, maxDom, maxBacklog, avgRate } };
+    return {
+      level,
+      reasons,
+      stats: {
+        avgPerLine,
+        avgNativePct,
+        avgPluginPct,
+        avgWriteMs,
+        avgWritePct,
+        avgPerWriteMs,
+        avgWriteCalls,
+        maxDom,
+        maxBacklog,
+        avgRate,
+      },
+    };
   }
 }
 

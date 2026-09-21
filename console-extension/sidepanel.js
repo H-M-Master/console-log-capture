@@ -34,7 +34,7 @@ let diagWriter = null;
 let diagTimer = null;
 let diagFileNote = '';
 // 自动降级动作只做一次，避免反复切来切去
-const autoActions = { mutedNative: false, forcedFileOnly: false, clampedView: false };
+const autoActions = { mutedNative: false, forcedFileOnly: false, clampedView: false, slowedWrites: false };
 
 function diagLog(text) {
   if (diagWriter) diagWriter.note(text);
@@ -43,6 +43,15 @@ function diagLog(text) {
 // 自动降级：这是"不需要人工判断"的关键——发现问题就直接动手
 async function autoRemediate(result) {
   const changed = [];
+
+  // 对策 0：落盘太贵 → 把写入频率降到最低
+  // 实测单次 write() 固定开销可达数百毫秒，所以唯一有效的办法是减少调用次数。
+  if (!autoActions.slowedWrites && result.stats.avgWritePct > 15) {
+    autoActions.slowedWrites = true;
+    writeBatchBytes = 4 * 1024 * 1024;
+    writeFlushMs = 10000;
+    changed.push('已自动降低落盘频率（单次写入开销过高）');
+  }
 
   // 对策 1：原生 console 太贵 → 自动静音
   if (!autoActions.mutedNative && result.stats.avgNativePct > 40) {
@@ -79,7 +88,9 @@ function updateDiagDisplay(result, changed) {
   const level = result.level === 'severe' ? '严重' : result.level === 'warn' ? '注意' : '正常';
   let text =
     `自检[${level}] 速率 ${s.avgRate.toFixed(0)}/s｜采集 ${s.avgPerLine.toFixed(1)}µs/条｜` +
-    `插件占 ${s.avgPluginPct.toFixed(2)}%｜原生 ${s.avgNativePct.toFixed(1)}%｜DOM ${s.maxDom}｜积压 ${s.maxBacklog}`;
+    `插件占 ${s.avgPluginPct.toFixed(2)}%｜原生 ${s.avgNativePct.toFixed(1)}%｜` +
+    `落盘 ${s.avgWritePct.toFixed(0)}%(${s.avgWriteCalls.toFixed(1)}次/秒,单次${s.avgPerWriteMs.toFixed(0)}ms)｜` +
+    `DOM ${s.maxDom}｜积压 ${s.maxBacklog}`;
   if (result.reasons.length) text += '\n⚠ ' + result.reasons.join('；');
   if (changed && changed.length) text += '\n✓ ' + changed.join('；');
   if (lastLongTaskNote) text += '\n⚠ ' + lastLongTaskNote;
@@ -958,33 +969,48 @@ async function appendBatch(batch) {
   }
 }
 
-// ---------- 落盘：攒批写入，避免高频小写入造成 I/O 尖峰 ----------
-// 实测发现每 300ms 写一次小批量时，偶尔会出现 300~400ms 的写入阻塞，
-// 那个窗口的 CPU 占用会从 1% 跳到 7~10%。改成攒量/攒时再写，把尖峰摊平。
-const WRITE_BATCH_BYTES = 64 * 1024; // 攒够 64KB 就写
-const WRITE_FLUSH_MS = 1000; // 或者最多等 1 秒
+// ---------- 落盘：低频攒批写入 ----------
+// 实测（诊断文件 92 个样本）：每次 write() 调用的固定开销就有 300~900ms，
+// 且与数据量几乎无关——每秒 115 条（几 KB）时仍要 743ms，每秒 741 条时是 475ms。
+// 原因是 File System Access API 写入的是临时交换文件，每次调用都要走一次提交，
+// 所以真正的成本在"调用次数"上，不在字节数上。
+// 因此这里把频率压到最低：攒够 1MB 或满 5 秒才写一次。
+// 这样每秒的磁盘占用从几百毫秒降到几十毫秒，同时靠内存缓冲保证不丢日志。
+let writeBatchBytes = 1024 * 1024; // 攒够 1MB 就写（可被自动降级调大）
+let writeFlushMs = 5000; // 或者最多等 5 秒（可被自动降级调大）
+const MAX_PENDING_BYTES = 8 * 1024 * 1024; // 内存里最多攒 8MB，防极端情况吃光内存
 let pendingWriteChunks = [];
 let pendingWriteBytes = 0;
 let writeFlushTimer = null;
+let writeCallCount = 0;
 
 function enqueueWrite(text) {
   pendingWriteChunks.push(text);
   pendingWriteBytes += text.length;
-  if (pendingWriteBytes >= WRITE_BATCH_BYTES) {
+
+  // 防内存失控：攒太多时强制写一次
+  if (pendingWriteBytes >= MAX_PENDING_BYTES) {
     flushWrite();
+    return;
+  }
+  if (pendingWriteBytes >= writeBatchBytes) {
+    // 攒够了也等定时器来写，避免高频日志下每秒都触发；
+    // 只有定时器还没排上时才立即写，保持"至多每个窗口一次"的节奏。
+    if (!writeFlushTimer) flushWrite();
     return;
   }
   if (!writeFlushTimer) {
     writeFlushTimer = setTimeout(() => {
       writeFlushTimer = null;
       flushWrite();
-    }, WRITE_FLUSH_MS);
+    }, writeFlushMs);
   }
 }
 
 async function flushWrite() {
   if (!writable || pendingWriteChunks.length === 0) return;
   const payload = pendingWriteChunks.join('');
+  const bytes = pendingWriteBytes;
   pendingWriteChunks = [];
   pendingWriteBytes = 0;
   const tw = performance.now();
@@ -994,7 +1020,10 @@ async function flushWrite() {
     setStatus('写入本地文件失败：' + e.message, 'error');
     diagLog('写入本地文件失败：' + e.message);
   }
-  collector.addWrite(performance.now() - tw);
+  const ms = performance.now() - tw;
+  collector.addWrite(ms);
+  writeCallCount++;
+  collector.addWriteCall(ms, bytes);
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
