@@ -89,7 +89,8 @@ function updateDiagDisplay(result, changed) {
   let text =
     `自检[${level}] 速率 ${s.avgRate.toFixed(0)}/s｜采集 ${s.avgPerLine.toFixed(1)}µs/条｜` +
     `插件占 ${s.avgPluginPct.toFixed(2)}%｜原生 ${s.avgNativePct.toFixed(1)}%｜` +
-    `落盘 ${s.avgWritePct.toFixed(0)}%(${s.avgWriteCalls.toFixed(1)}次/秒,单次${s.avgPerWriteMs.toFixed(0)}ms)｜` +
+    `落盘 ${s.avgWritePct.toFixed(0)}%(${s.avgWriteCalls.toFixed(1)}次/秒,单次${s.avgPerWriteMs.toFixed(0)}ms` +
+    `,${writeWorker ? 'worker:' + writeWorkerMode : writable ? '主线程' : '未开'})｜` +
     `DOM ${s.maxDom}｜积压 ${s.maxBacklog}`;
   if (result.reasons.length) text += '\n⚠ ' + result.reasons.join('；');
   if (changed && changed.length) text += '\n✓ ' + changed.join('；');
@@ -126,6 +127,8 @@ function startDiagHeartbeat() {
     }
 
     const sample = collector.flush();
+    // 把写入方式记进每个样本，事后一眼就能判断 worker 是否真的生效
+    sample.writeMode = writeWorker ? 'worker:' + writeWorkerMode : writable ? 'main' : 'none';
     if (diagWriter) diagWriter.sample(sample);
 
     const result = collector.diagnose(5);
@@ -985,8 +988,10 @@ async function appendBatch(batch) {
 // 尖峰再大也只卡 worker 自己那条线程，不影响渲染和游戏。
 // 这里仍保留一层小的合并（攒 256KB 或 2 秒），只是为了减少 postMessage 次数，
 // 不再需要靠它规避写入尖峰。
+// 主线程这边只负责合并后交给 worker，所以可以攒得更久一些：
+// 之前 2 秒的定时器导致每次只攒 13KB 就冲刷，白白多出很多次调用。
 let writeBatchBytes = 256 * 1024;
-let writeFlushMs = 2000;
+let writeFlushMs = 8000;
 const MAX_PENDING_BYTES = 8 * 1024 * 1024; // 内存里最多攒 8MB，防极端情况吃光内存
 let pendingWriteChunks = [];
 let pendingWriteBytes = 0;
@@ -1179,68 +1184,88 @@ async function startDiagWriter(handle) {
 // 启动 worker 并让它打开日志文件。成功返回 true。
 function startWriteWorker(dirHandle, fileName) {
   return new Promise((resolve) => {
+    let w = null;
     try {
       stopWriteWorker();
-      const w = new Worker('write-worker.js');
-      let settled = false;
-
-      w.onmessage = (e) => {
-        const msg = e.data;
-        if (!msg) return;
-
-        if (msg.type === 'opened') {
-          writeWorker = w;
-          writeWorkerMode = msg.mode;
-          diagLog(`写文件 worker 已启动，模式=${msg.mode}`);
-          if (!settled) {
-            settled = true;
-            resolve(true);
-          }
-          return;
-        }
-
-        // worker 回报的真实落盘开销：这才是准确数字，主线程自己测不到
-        if (msg.type === 'stats') {
-          const s = msg.stats;
-          if (s && s.calls > 0) {
-            collector.addWrite(s.totalMs);
-            collector.addWriteCall(s.totalMs / s.calls, s.bytes);
-            // calls 可能 >1，把剩余次数补上，保证 writeCalls 统计准确
-            for (let i = 1; i < s.calls; i++) collector.addWriteCall(0, 0);
-          }
-          if (s && s.queued > 200) {
-            diagLog(`写入队列积压 ${s.queued} 批，磁盘跟不上`);
-          }
-          return;
-        }
-
-        if (msg.type === 'error') {
-          diagLog('worker 写入错误：' + msg.message);
-          return;
-        }
-      };
-
-      w.onerror = (err) => {
-        diagLog('worker 启动失败：' + (err && err.message ? err.message : '未知错误'));
-        if (!settled) {
-          settled = true;
-          resolve(false);
-        }
-      };
-
-      w.postMessage({ type: 'open', dirHandle, fileName });
-
-      // 超时保护：3 秒还没开起来就退回主线程
-      setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          resolve(false);
-        }
-      }, 3000);
+      // 必须用扩展的绝对 URL：侧边栏页面里相对路径不一定能解析到
+      const url = chrome.runtime.getURL('write-worker.js');
+      w = new Worker(url);
     } catch (e) {
-      diagLog('无法创建 worker：' + e.message);
+      diagLog('创建 worker 失败：' + e.message);
+      setStatus('写文件 worker 创建失败，改用主线程写入：' + e.message, 'error');
       resolve(false);
+      return;
     }
+
+    let settled = false;
+    const fail = (why) => {
+      if (settled) return;
+      settled = true;
+      diagLog('worker 启动失败：' + why);
+      try {
+        w.terminate();
+      } catch (e2) {}
+      resolve(false);
+    };
+
+    w.onmessage = (e) => {
+      const msg = e.data;
+      if (!msg) return;
+
+      if (msg.type === 'opened') {
+        writeWorker = w;
+        writeWorkerMode = msg.mode;
+        diagLog(`写文件 worker 已启动，模式=${msg.mode}`);
+        if (!settled) {
+          settled = true;
+          resolve(true);
+        }
+        return;
+      }
+
+      // 打开文件阶段就报错 -> 直接判定失败，退回主线程
+      if (msg.type === 'error') {
+        if (!settled) {
+          fail(msg.message);
+          return;
+        }
+        diagLog('worker 写入错误：' + msg.message);
+        return;
+      }
+
+      // worker 回报的真实落盘开销：这才是准确数字，主线程自己测不到
+      if (msg.type === 'stats') {
+        const s = msg.stats;
+        if (s && s.calls > 0) {
+          collector.addWrite(s.totalMs);
+          collector.addWriteCall(s.totalMs / s.calls, s.bytes);
+          // calls 可能 >1，把剩余次数补上，保证 writeCalls 统计准确
+          for (let i = 1; i < s.calls; i++) collector.addWriteCall(0, 0);
+        }
+        if (s && s.queued > 200) {
+          diagLog(`写入队列积压 ${s.queued} 批，磁盘跟不上`);
+        }
+        return;
+      }
+    };
+
+    w.onerror = (err) => {
+      // Worker 里的语法错误/加载失败会走这里
+      const why = err && err.message ? err.message : `加载失败（${err && err.filename ? err.filename : '未知文件'}）`;
+      fail(why);
+    };
+
+    w.onmessageerror = () => fail('消息序列化失败（dirHandle 可能无法传递给 worker）');
+
+    try {
+      w.postMessage({ type: 'open', dirHandle, fileName });
+    } catch (e) {
+      fail('无法把目录句柄传给 worker：' + e.message);
+      return;
+    }
+
+    // 超时保护：3 秒还没开起来就退回主线程
+    setTimeout(() => fail('3 秒内没有响应'), 3000);
   });
 }
 
