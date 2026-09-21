@@ -1335,7 +1335,8 @@ startBtn.addEventListener('click', async () => {
     startRateTimer();
     resetStats();
     startDiagHeartbeat();
-    setStatus(`采集中 → ${fileHandle.name}`, 'running');
+    const modeNote = writeWorker ? `worker:${writeWorkerMode}` : '主线程';
+    setStatus(`采集中 → ${logFileName}（写入方式：${modeNote}）`, 'running');
   } catch (e) {
     setStatus('开始失败：' + e.message, 'error');
   }
