@@ -112,6 +112,9 @@ function startDiagHeartbeat() {
     }
     collector.setVisible(document.visibilityState === 'visible');
 
+    // 向 worker 要一次落盘统计（它会在下一条消息里回报）
+    if (writeWorker) writeWorker.postMessage({ type: 'stats' });
+
     diagSampleCount++;
 
     // 每 5 秒做一次页面侧自检：主要看 console 是否被叠包了多层。
@@ -260,6 +263,9 @@ const LEVEL_TO_CATEGORY = {
 let targetTabId = null;
 let dirHandle = null;
 let writable = null;
+// 写文件工作线程：所有磁盘 I/O 都在它那边做，主线程不碰
+let writeWorker = null;
+let writeWorkerMode = 'none'; // 'sync' | 'stream' | 'none'
 let totalCount = 0;
 let droppedCount = 0;
 let running = false;
@@ -964,39 +970,35 @@ async function appendBatch(batch) {
   // 视图按节流渲染，不做全量重建
   scheduleRender(false);
 
-  if (writable) {
+  if (writeWorker || writable) {
     enqueueWrite(fileLines.join('\n') + '\n');
   }
 }
 
-// ---------- 落盘：低频攒批写入 ----------
-// 实测（诊断文件 92 个样本）：每次 write() 调用的固定开销就有 300~900ms，
-// 且与数据量几乎无关——每秒 115 条（几 KB）时仍要 743ms，每秒 741 条时是 475ms。
-// 原因是 File System Access API 写入的是临时交换文件，每次调用都要走一次提交，
-// 所以真正的成本在"调用次数"上，不在字节数上。
-// 因此这里把频率压到最低：攒够 1MB 或满 5 秒才写一次。
-// 这样每秒的磁盘占用从几百毫秒降到几十毫秒，同时靠内存缓冲保证不丢日志。
-let writeBatchBytes = 1024 * 1024; // 攒够 1MB 就写（可被自动降级调大）
-let writeFlushMs = 5000; // 或者最多等 5 秒（可被自动降级调大）
+// ---------- 落盘：交给 worker 线程 ----------
+// 实测 FileSystemWritableFileStream.write() 的耗时极不稳定：中位数只有 2ms，
+// 但会偶发飙到 316ms / 722ms / 2442ms，且与数据量无关（2442ms 那次只写 3.3KB，
+// 而 45KB 那次只花 4ms）。这是 Chrome 提交文件时被系统 I/O 阻塞，
+// 只要发生在主线程上，面板和整个浏览器就跟着卡。
+//
+// 所以文件 I/O 全部搬进 write-worker.js：主线程只负责把文本丢过去，
+// 尖峰再大也只卡 worker 自己那条线程，不影响渲染和游戏。
+// 这里仍保留一层小的合并（攒 256KB 或 2 秒），只是为了减少 postMessage 次数，
+// 不再需要靠它规避写入尖峰。
+let writeBatchBytes = 256 * 1024;
+let writeFlushMs = 2000;
 const MAX_PENDING_BYTES = 8 * 1024 * 1024; // 内存里最多攒 8MB，防极端情况吃光内存
 let pendingWriteChunks = [];
 let pendingWriteBytes = 0;
 let writeFlushTimer = null;
-let writeCallCount = 0;
 
 function enqueueWrite(text) {
   pendingWriteChunks.push(text);
   pendingWriteBytes += text.length;
 
-  // 防内存失控：攒太多时强制写一次
-  if (pendingWriteBytes >= MAX_PENDING_BYTES) {
+  // 防内存失控：攒太多时立刻交出去
+  if (pendingWriteBytes >= MAX_PENDING_BYTES || pendingWriteBytes >= writeBatchBytes) {
     flushWrite();
-    return;
-  }
-  if (pendingWriteBytes >= writeBatchBytes) {
-    // 攒够了也等定时器来写，避免高频日志下每秒都触发；
-    // 只有定时器还没排上时才立即写，保持"至多每个窗口一次"的节奏。
-    if (!writeFlushTimer) flushWrite();
     return;
   }
   if (!writeFlushTimer) {
@@ -1007,23 +1009,34 @@ function enqueueWrite(text) {
   }
 }
 
-async function flushWrite() {
-  if (!writable || pendingWriteChunks.length === 0) return;
+// 把攒着的文本交给 worker。这个函数不再做真正的 I/O，
+// 所以是同步的、几乎零耗时——真正的写入耗时由 worker 统计后回报。
+function flushWrite() {
+  if (pendingWriteChunks.length === 0) return;
   const payload = pendingWriteChunks.join('');
-  const bytes = pendingWriteBytes;
   pendingWriteChunks = [];
   pendingWriteBytes = 0;
-  const tw = performance.now();
-  try {
-    await writable.write(payload);
-  } catch (e) {
-    setStatus('写入本地文件失败：' + e.message, 'error');
-    diagLog('写入本地文件失败：' + e.message);
+
+  if (writeWorker) {
+    writeWorker.postMessage({ type: 'write', text: payload });
+    return;
   }
-  const ms = performance.now() - tw;
-  collector.addWrite(ms);
-  writeCallCount++;
-  collector.addWriteCall(ms, bytes);
+
+  // worker 不可用时的退路：仍在主线程写，但会被诊断记录下来
+  if (writable) {
+    const tw = performance.now();
+    writable
+      .write(payload)
+      .catch((e) => {
+        setStatus('写入本地文件失败：' + e.message, 'error');
+        diagLog('写入本地文件失败：' + e.message);
+      })
+      .finally(() => {
+        const ms = performance.now() - tw;
+        collector.addWrite(ms);
+        collector.addWriteCall(ms, payload.length);
+      });
+  }
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
@@ -1082,7 +1095,7 @@ async function appendTextBatch(text) {
   rateWindowCount += n;
   updateLineCount();
 
-  if (writable) {
+  if (writeWorker || writable) {
     enqueueWrite(text);
   }
 }
@@ -1162,6 +1175,117 @@ async function startDiagWriter(handle) {
   }
 }
 
+// ---------- 写文件工作线程的生命周期 ----------
+// 启动 worker 并让它打开日志文件。成功返回 true。
+function startWriteWorker(dirHandle, fileName) {
+  return new Promise((resolve) => {
+    try {
+      stopWriteWorker();
+      const w = new Worker('write-worker.js');
+      let settled = false;
+
+      w.onmessage = (e) => {
+        const msg = e.data;
+        if (!msg) return;
+
+        if (msg.type === 'opened') {
+          writeWorker = w;
+          writeWorkerMode = msg.mode;
+          diagLog(`写文件 worker 已启动，模式=${msg.mode}`);
+          if (!settled) {
+            settled = true;
+            resolve(true);
+          }
+          return;
+        }
+
+        // worker 回报的真实落盘开销：这才是准确数字，主线程自己测不到
+        if (msg.type === 'stats') {
+          const s = msg.stats;
+          if (s && s.calls > 0) {
+            collector.addWrite(s.totalMs);
+            collector.addWriteCall(s.totalMs / s.calls, s.bytes);
+            // calls 可能 >1，把剩余次数补上，保证 writeCalls 统计准确
+            for (let i = 1; i < s.calls; i++) collector.addWriteCall(0, 0);
+          }
+          if (s && s.queued > 200) {
+            diagLog(`写入队列积压 ${s.queued} 批，磁盘跟不上`);
+          }
+          return;
+        }
+
+        if (msg.type === 'error') {
+          diagLog('worker 写入错误：' + msg.message);
+          return;
+        }
+      };
+
+      w.onerror = (err) => {
+        diagLog('worker 启动失败：' + (err && err.message ? err.message : '未知错误'));
+        if (!settled) {
+          settled = true;
+          resolve(false);
+        }
+      };
+
+      w.postMessage({ type: 'open', dirHandle, fileName });
+
+      // 超时保护：3 秒还没开起来就退回主线程
+      setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve(false);
+        }
+      }, 3000);
+    } catch (e) {
+      diagLog('无法创建 worker：' + e.message);
+      resolve(false);
+    }
+  });
+}
+
+function stopWriteWorker() {
+  if (writeWorker) {
+    try {
+      writeWorker.terminate();
+    } catch (e) {}
+    writeWorker = null;
+  }
+  writeWorkerMode = 'none';
+}
+
+// 请 worker 把文件收尾关闭，等它确认后再继续
+function closeWriteWorker() {
+  return new Promise((resolve) => {
+    if (!writeWorker) {
+      resolve();
+      return;
+    }
+    const w = writeWorker;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try {
+        w.terminate();
+      } catch (e) {}
+      writeWorker = null;
+      writeWorkerMode = 'none';
+      resolve();
+    };
+    const prev = w.onmessage;
+    w.onmessage = (e) => {
+      if (e.data && e.data.type === 'closed') {
+        finish();
+        return;
+      }
+      if (prev) prev(e);
+    };
+    w.postMessage({ type: 'close' });
+    setTimeout(finish, 5000); // 别无限等
+  });
+}
+
 startBtn.addEventListener('click', async () => {
   try {
     const tab = await getActiveTab();
@@ -1175,8 +1299,15 @@ startBtn.addEventListener('click', async () => {
     const handle = await ensureDirHandle();
 
     currentSessionTs = new Date().toISOString().replace(/[:.]/g, '-');
-    const fileHandle = await handle.getFileHandle(`console-log-${currentSessionTs}.txt`, { create: true });
-    writable = await fileHandle.createWritable({ keepExistingData: false });
+    const logFileName = `console-log-${currentSessionTs}.txt`;
+
+    // 优先让 worker 接管文件写入；worker 起不来才退回主线程写
+    const workerOk = await startWriteWorker(handle, logFileName);
+    if (!workerOk) {
+      const fileHandle = await handle.getFileHandle(logFileName, { create: true });
+      writable = await fileHandle.createWritable({ keepExistingData: false });
+      diagLog('worker 不可用，退回主线程写入');
+    }
 
     // 诊断文件也写到同一个目录（用户自己选的，通常不是 Cocos 项目内）
     await startDiagWriter(handle);
@@ -1226,12 +1357,15 @@ async function stopCapture(reason) {
     renderTimer = null;
   }
 
-  // 关文件前必须先把攒着的日志全写下去，否则会丢最后一批
+  // 关文件前必须先把攒着的日志全交出去，否则会丢最后一批
   if (writeFlushTimer) {
     clearTimeout(writeFlushTimer);
     writeFlushTimer = null;
   }
-  await flushWrite();
+  flushWrite();
+
+  // 让 worker 把队列写完并关闭文件
+  await closeWriteWorker();
 
   // 收尾诊断文件：把最后一段窗口和结论也记下来
   if (diagWriter) {
