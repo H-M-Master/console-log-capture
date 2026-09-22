@@ -25,7 +25,6 @@ const nextErrorBtn = document.getElementById('nextErrorBtn');
 const diagBtn = document.getElementById('diagBtn');
 const overheadEl = document.getElementById('overhead');
 const muteNativeToggle = document.getElementById('muteNativeToggle');
-const liveErrorsToggle = document.getElementById('liveErrorsToggle');
 const fileOnlyToggle = document.getElementById('fileOnlyToggle');
 const diagInfoEl = document.getElementById('diagInfo');
 
@@ -42,8 +41,8 @@ function persistToggles() {
       'cc-toggles',
       JSON.stringify({
         muteNative: muteNativeToggle.checked,
-        liveErrorsOnly: liveErrorsToggle.checked,
         fileOnly: fileOnlyToggle.checked,
+        levels: activeCategories(),
       })
     );
   } catch (e) {}
@@ -55,12 +54,12 @@ function restoreToggles() {
     if (!raw) return;
     const t = JSON.parse(raw);
     if (typeof t.muteNative === 'boolean') muteNativeToggle.checked = t.muteNative;
-    if (typeof t.liveErrorsOnly === 'boolean') liveErrorsToggle.checked = t.liveErrorsOnly;
     if (typeof t.fileOnly === 'boolean') fileOnlyToggle.checked = t.fileOnly;
-    // 旧版默认勾了「只落盘」，会把实时错误也关掉。迁到「实时仅错误」。
-    if (t.liveErrorsOnly === undefined && t.fileOnly === true) {
-      liveErrorsToggle.checked = true;
-      fileOnlyToggle.checked = false;
+    if (Array.isArray(t.levels) && t.levels.length) {
+      levelCheckboxes.forEach((cb) => {
+        cb.checked = t.levels.includes(cb.dataset.level);
+      });
+      filterAllEl.checked = levelCheckboxes.every((c) => c.checked);
     }
   } catch (e) {}
 }
@@ -95,14 +94,17 @@ async function autoRemediate(result) {
     changed.push('已自动开启静音（原生 console 开销过高或日志暴涨）');
   }
 
-  // 对策 2：日志暴涨时 Info 刷屏会卡，但错误仍要实时看见
+  // 对策 2：日志暴涨时 Info 刷屏会卡 —— 自动取消 Info/Verbose，只留错误和警告
   if (!autoActions.forcedFileOnly && (result.stats.avgPluginPct > 15 || result.stats.avgRate > 80)) {
     autoActions.forcedFileOnly = true;
-    liveErrorsToggle.checked = true;
-    fileOnlyToggle.checked = false;
+    levelCheckboxes.forEach((cb) => {
+      cb.checked = cb.dataset.level === 'errors' || cb.dataset.level === 'warnings';
+    });
+    filterAllEl.checked = false;
     persistToggles();
     await pushConfigToPage();
-    changed.push('已自动改为实时仅错误/警告（Info 洪峰不刷侧边栏，错误仍立刻显示）');
+    scheduleRender(true);
+    changed.push('日志暴涨：已取消 Info/Verbose 实时显示，错误和警告仍立刻可见');
   }
 
   // 对策 3：视图出问题 → 自动收紧视图上限并重建
@@ -702,12 +704,9 @@ function mainWorldCapture() {
 
   // 采集配置：由侧边栏通过 postMessage 下发（避免每次改配置都重新注入脚本）
   const cfg = {
-    // 静音：不调用原生 console。拖角色时这条是卡顿主因。
     muteNative: false,
-    // 完全不刷侧边栏，只送纯文本写文件。
     fileOnly: false,
-    // 侧边栏只收 error/warn；全文仍以纯文本落盘。Info 洪峰不克隆、不刷 DOM。
-    liveErrorsOnly: false,
+    liveLevels: ['warnings', 'errors'],
   };
   window.__ccCfg = cfg;
 
@@ -785,8 +784,15 @@ function mainWorldCapture() {
     } catch (err) {}
   });
 
-  function isHotLevel(level) {
-    return level === 'error' || level === 'warn' || level === 'uncaught-exception' || level === 'unhandled-rejection';
+  function isLiveLevel(level) {
+    const cat = level === 'error' || level === 'uncaught-exception' || level === 'unhandled-rejection'
+      ? 'errors'
+      : level === 'warn'
+        ? 'warnings'
+        : level === 'debug'
+          ? 'verbose'
+          : 'info';
+    return cfg.liveLevels.indexOf(cat) !== -1;
   }
 
   function flush() {
@@ -797,12 +803,12 @@ function mainWorldCapture() {
       if (!batch || batch.length === 0) break;
 
       try {
-        // 全文始终以纯文本落盘（结构化克隆对象数组才贵）
-        if (cfg.fileOnly || cfg.liveErrorsOnly) {
+        const liveAll = cfg.liveLevels.length === 4;
+        if (cfg.fileOnly || !liveAll) {
           window.postMessage({ __ccBatchText: formatBatchToText(batch) }, '*');
         }
         if (!cfg.fileOnly) {
-          const live = cfg.liveErrorsOnly ? batch.filter((b) => isHotLevel(b.level)) : batch;
+          const live = liveAll ? batch : batch.filter((b) => isLiveLevel(b.level));
           if (live.length) window.postMessage({ __ccBatch: true, batch: live }, '*');
         }
       } catch (err) {
@@ -912,7 +918,7 @@ function mainWorldCapture() {
     if (d.__ccSetConfig) {
       if (typeof d.muteNative === 'boolean') cfg.muteNative = d.muteNative;
       if (typeof d.fileOnly === 'boolean') cfg.fileOnly = d.fileOnly;
-      if (typeof d.liveErrorsOnly === 'boolean') cfg.liveErrorsOnly = d.liveErrorsOnly;
+      if (Array.isArray(d.liveLevels)) cfg.liveLevels = d.liveLevels;
       reportStats();
     }
   });
@@ -991,10 +997,8 @@ async function appendBatch(batch) {
     const row = { level: entry.level, category, text: entry.text, time: entry.time, count: 1, seq: nextSeq++ };
 
     categoryCounts[category]++;
-    if (!liveErrorsToggle.checked) {
-      totalCount++;
-      rateWindowCount++;
-    }
+    totalCount++;
+    rateWindowCount++;
 
     // 追加到视图数组，超出上限时从头部丢弃（DOM 会在渲染时同步裁剪）
     displayRows.push(row);
@@ -1016,8 +1020,9 @@ async function appendBatch(batch) {
   updateStatsBar();
   scheduleRender(false);
 
-  // 实时仅错误时，全文已经由文本通道落盘，这里只刷新视图，避免写两遍
-  if ((writeWorker || writable) && !liveErrorsToggle.checked && !fileOnlyToggle.checked) {
+  // 未勾全级别时，全文已由文本通道落盘，这里只刷新已勾选级别的视图
+  const liveAll = activeCategories().length === levelCheckboxes.length;
+  if ((writeWorker || writable) && liveAll && !fileOnlyToggle.checked) {
     enqueueWrite(fileLines.join('\n') + '\n');
   }
 }
@@ -1106,7 +1111,7 @@ async function pushConfigToPage() {
     const cfg = {
       muteNative: muteNativeToggle.checked,
       fileOnly: fileOnlyToggle.checked,
-      liveErrorsOnly: liveErrorsToggle.checked,
+      liveLevels: activeCategories(),
     };
     await chrome.scripting.executeScript({
       target: { tabId: targetTabId },
@@ -1122,20 +1127,6 @@ async function pushConfigToPage() {
 muteNativeToggle.addEventListener('change', () => {
   persistToggles();
   pushConfigToPage();
-});
-liveErrorsToggle.addEventListener('change', () => {
-  persistToggles();
-  pushConfigToPage();
-  if (liveErrorsToggle.checked && fileOnlyToggle.checked) {
-    fileOnlyToggle.checked = false;
-    persistToggles();
-  }
-  setStatus(
-    liveErrorsToggle.checked
-      ? '实时仅错误/警告：Info 不刷侧边栏，错误出现会立刻显示；完整日志仍写入文件'
-      : '侧边栏显示全部级别（拖角色时可能卡）',
-    'running'
-  );
 });
 fileOnlyToggle.addEventListener('change', () => {
   persistToggles();
@@ -1232,7 +1223,7 @@ async function startDiagWriter(handle) {
     diagLog('采集开始');
     diagLog(`阈值：${JSON.stringify(window.CCDiag.THRESHOLDS)}`);
     diagLog(
-      `配置：静音=${muteNativeToggle.checked} 实时仅错误=${liveErrorsToggle.checked} 不刷侧边栏=${fileOnlyToggle.checked} ` +
+      `配置：静音=${muteNativeToggle.checked} 不刷侧边栏=${fileOnlyToggle.checked} 实时级别=${activeCategories().join(',') || '无'} ` +
         `视图上限=${MAX_DISPLAY_ROWS} 页面缓冲上限=2000 单批=500`
     );
   } catch (e) {
@@ -1584,6 +1575,8 @@ diagBtn.addEventListener('click', async () => {
 levelCheckboxes.forEach((cb) => {
   cb.addEventListener('change', () => {
     filterAllEl.checked = levelCheckboxes.every((c) => c.checked);
+    persistToggles();
+    pushConfigToPage();
     scheduleRender(true);
   });
 });
@@ -1592,6 +1585,8 @@ filterAllEl.addEventListener('change', () => {
   levelCheckboxes.forEach((cb) => {
     cb.checked = filterAllEl.checked;
   });
+  persistToggles();
+  pushConfigToPage();
   scheduleRender(true);
 });
 
@@ -1604,6 +1599,8 @@ function showOnlyCategory(category) {
     cb.checked = cb.dataset.level === category;
   });
   filterAllEl.checked = false;
+  persistToggles();
+  pushConfigToPage();
   rebuildView();
 }
 

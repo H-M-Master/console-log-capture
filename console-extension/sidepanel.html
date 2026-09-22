@@ -191,12 +191,12 @@
     <details id="filterDropdown">
       <summary id="filterSummary">全部级别</summary>
       <div class="filter-menu">
-        <label><input type="checkbox" data-level="verbose" checked> Verbose</label>
-        <label><input type="checkbox" data-level="info" checked> Info</label>
+        <label><input type="checkbox" data-level="verbose"> Verbose</label>
+        <label><input type="checkbox" data-level="info"> Info</label>
         <label><input type="checkbox" data-level="warnings" checked> Warnings</label>
         <label><input type="checkbox" data-level="errors" checked> Errors</label>
         <hr>
-        <label><input type="checkbox" id="filterAll" checked> 全选/全不选</label>
+        <label><input type="checkbox" id="filterAll"> 全选/全不选</label>
       </div>
     </details>
     <input type="text" id="searchInput" placeholder="搜索关键字...">
@@ -205,9 +205,6 @@
   <div class="toolbar">
     <label class="mergeToggleLabel" title="不再调用浏览器原生 console。拖角色时这条是卡顿主因，建议保持勾选">
       <input type="checkbox" id="muteNativeToggle" checked> 静音（不动原生 console）
-    </label>
-    <label class="mergeToggleLabel" title="侧边栏只实时显示 error/warn/未捕获异常，Info 洪峰不刷列表。完整日志仍写入文件，错误出现时能立刻看到">
-      <input type="checkbox" id="liveErrorsToggle" checked> 实时仅错误/警告
     </label>
     <label class="mergeToggleLabel" title="连错误也不送侧边栏，只写文件。一般不必勾；需要极限性能时再用">
       <input type="checkbox" id="fileOnlyToggle"> 完全不刷侧边栏
