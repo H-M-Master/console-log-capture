@@ -4,12 +4,13 @@
 // 因为它用交换文件，每次提交都要处理整份已有内容。createSyncAccessHandle()
 // 只对源私有文件系统（OPFS）可用，用户手选的目录用不了。
 //
-// 所以实时写入全部进 OPFS（O(1) 追加），再定期 / 结束时一次性拷到用户目录。
-// 拷贝发生在本线程，尖峰不再打到侧边栏或游戏页面。
+// 所以实时写入全部进 OPFS（O(1) 追加）。用户目录那一下是整份覆盖，
+// 文件越大越慢，采集过程中不做。只在用户点「同步到目录」或「停止」时拷一次。
 //
 // 协议：
 //   收 { type: 'open', dirHandle, fileName }  -> 回 { type: 'opened', mode }
 //   收 { type: 'write', text }                -> 不回
+//   收 { type: 'export' }                     -> 回 { type: 'exported', bytes }
 //   收 { type: 'close' }                      -> 回 { type: 'closed', stats }
 //   收 { type: 'stats' }                      -> 回 { type: 'stats', stats }
 //   错                                      -> 回 { type: 'error', message }
@@ -23,10 +24,8 @@ let opfsFileHandle = null;
 let writeOffset = 0;
 let lastCopiedSize = -1;
 let mode = 'none';
-let exportTimer = null;
 
 const encoder = new TextEncoder();
-const EXPORT_MS = 30000;
 
 const queue = [];
 let draining = false;
@@ -83,7 +82,6 @@ async function open(dirHandle, fileName) {
 
   try {
     await openOpfs(fileName);
-    startExportTimer();
     return mode;
   } catch (e) {
     try {
@@ -98,20 +96,6 @@ async function open(dirHandle, fileName) {
 
   await openStream(dirHandle, fileName);
   return mode;
-}
-
-function startExportTimer() {
-  stopExportTimer();
-  exportTimer = setInterval(() => {
-    exportToDest(true);
-  }, EXPORT_MS);
-}
-
-function stopExportTimer() {
-  if (exportTimer) {
-    clearInterval(exportTimer);
-    exportTimer = null;
-  }
 }
 
 function enqueue(text) {
@@ -200,7 +184,6 @@ function exportToDest(reopen) {
 }
 
 async function close() {
-  stopExportTimer();
   if (exportPromise) await exportPromise;
   await drain();
   try {
@@ -237,6 +220,12 @@ self.onmessage = async (e) => {
 
     if (msg.type === 'write') {
       enqueue(msg.text);
+      return;
+    }
+
+    if (msg.type === 'export') {
+      await exportToDest(true);
+      self.postMessage({ type: 'exported', bytes: lastCopiedSize < 0 ? 0 : lastCopiedSize });
       return;
     }
 

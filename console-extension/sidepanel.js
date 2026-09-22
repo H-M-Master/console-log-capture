@@ -1,5 +1,6 @@
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
+const syncBtn = document.getElementById('syncBtn');
 const clearBtn = document.getElementById('clearBtn');
 const changeDirBtn = document.getElementById('changeDirBtn');
 const dirLabelEl = document.getElementById('dirLabel');
@@ -1215,7 +1216,7 @@ function startWriteWorker(dirHandle, fileName) {
       if (msg.type === 'opened') {
         writeWorker = w;
         writeWorkerMode = msg.mode;
-        diagLog(`写文件 worker 已启动，模式=${msg.mode}${msg.mode === 'opfs' ? '（实时写 OPFS，定期拷到所选目录）' : ''}`);
+        diagLog(`写文件 worker 已启动，模式=${msg.mode}${msg.mode === 'opfs' ? '（实时只追加写 OPFS，点同步或停止才拷到所选目录）' : ''}`);
         if (!settled) {
           settled = true;
           resolve(true);
@@ -1245,6 +1246,13 @@ function startWriteWorker(dirHandle, fileName) {
         if (s && s.queued > 200) {
           diagLog(`写入队列积压 ${s.queued} 批，磁盘跟不上`);
         }
+        return;
+      }
+
+      if (msg.type === 'exported') {
+        const kb = msg.bytes > 0 ? (msg.bytes / 1024).toFixed(1) : '0';
+        setStatus(`已同步到所选目录（${kb} KB）`, 'running');
+        diagLog(`手动同步完成：${kb} KB`);
         return;
       }
     };
@@ -1356,12 +1364,13 @@ startBtn.addEventListener('click', async () => {
     running = true;
     startBtn.disabled = true;
     stopBtn.disabled = false;
+    syncBtn.disabled = writeWorkerMode !== 'opfs';
     changeDirBtn.disabled = true;
     startRateTimer();
     resetStats();
     startDiagHeartbeat();
     const modeNote = writeWorker ? `worker:${writeWorkerMode}` : '主线程';
-    const extra = writeWorkerMode === 'opfs' ? '；实时写浏览器缓存，约每 30 秒同步到所选目录' : '';
+    const extra = writeWorkerMode === 'opfs' ? '；实时只追加到浏览器缓存，点「同步到目录」或「停止」才写入所选文件夹' : '';
     setStatus(`采集中 → ${logFileName}（写入方式：${modeNote}${extra}）`, 'running');
   } catch (e) {
     setStatus('开始失败：' + e.message, 'error');
@@ -1435,11 +1444,22 @@ async function stopCapture(reason) {
 
   startBtn.disabled = false;
   stopBtn.disabled = true;
+  syncBtn.disabled = true;
   changeDirBtn.disabled = false;
   setStatus((reason || '已停止') + errorFileNote, 'stopped');
 }
 
 stopBtn.addEventListener('click', () => stopCapture('已停止'));
+
+syncBtn.addEventListener('click', () => {
+  if (!writeWorker || writeWorkerMode !== 'opfs') {
+    setStatus('当前不是 OPFS 模式，日志已在直接写入所选目录', 'stopped');
+    return;
+  }
+  flushWrite();
+  writeWorker.postMessage({ type: 'export' });
+  setStatus('正在同步到所选目录…', 'running');
+});
 
 // ---------- 自动检测页面被重新加载/重新编译 ----------
 // 游戏热重载或 Cocos 重新编译会让页面重新加载，注入的脚本随之消失，
