@@ -268,7 +268,7 @@ let dirHandle = null;
 let writable = null;
 // 写文件工作线程：所有磁盘 I/O 都在它那边做，主线程不碰
 let writeWorker = null;
-let writeWorkerMode = 'none'; // 'sync' | 'stream' | 'none'
+let writeWorkerMode = 'none'; // 'opfs' | 'stream' | 'none'
 let totalCount = 0;
 let droppedCount = 0;
 let running = false;
@@ -1215,7 +1215,7 @@ function startWriteWorker(dirHandle, fileName) {
       if (msg.type === 'opened') {
         writeWorker = w;
         writeWorkerMode = msg.mode;
-        diagLog(`写文件 worker 已启动，模式=${msg.mode}`);
+        diagLog(`写文件 worker 已启动，模式=${msg.mode}${msg.mode === 'opfs' ? '（实时写 OPFS，定期拷到所选目录）' : ''}`);
         if (!settled) {
           settled = true;
           resolve(true);
@@ -1307,7 +1307,7 @@ function closeWriteWorker() {
       if (prev) prev(e);
     };
     w.postMessage({ type: 'close' });
-    setTimeout(finish, 5000); // 别无限等
+    setTimeout(finish, 30000); // 拷贝到用户目录可能稍慢
   });
 }
 
@@ -1361,7 +1361,8 @@ startBtn.addEventListener('click', async () => {
     resetStats();
     startDiagHeartbeat();
     const modeNote = writeWorker ? `worker:${writeWorkerMode}` : '主线程';
-    setStatus(`采集中 → ${logFileName}（写入方式：${modeNote}）`, 'running');
+    const extra = writeWorkerMode === 'opfs' ? '；实时写浏览器缓存，约每 30 秒同步到所选目录' : '';
+    setStatus(`采集中 → ${logFileName}（写入方式：${modeNote}${extra}）`, 'running');
   } catch (e) {
     setStatus('开始失败：' + e.message, 'error');
   }

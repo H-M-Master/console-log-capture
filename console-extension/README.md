@@ -75,7 +75,7 @@
 
 另外几点关键行为：
 
-- **文件写入跑在独立的 Worker 线程里**（`write-worker.js`）。这是最重要的一条：实测 `FileSystemWritableFileStream.write()` 的耗时极不稳定——中位数只有 2ms，但会偶发飙到 316ms / 722ms / **2442ms**，而且**和数据量无关**（2442ms 那次只写了 3.3KB，而 45KB 那次只花 4ms）。这是 Chrome 提交文件时被系统 I/O 阻塞。只要它发生在主线程上，侧边栏和整个浏览器就会跟着卡。现在所有磁盘 I/O 都在 Worker 里做，尖峰再大也只卡 Worker 自己那条线程，不影响页面渲染和游戏。Worker 里优先使用 `createSyncAccessHandle()`（专为 Worker 设计的高性能同步写入接口），不支持时退回 `createWritable()`。
+- **文件写入跑在独立的 Worker 线程里**（`write-worker.js`）。实时日志先写入浏览器源私有文件系统（OPFS，`createSyncAccessHandle` 追加是 O(1)），每 30 秒和点「停止」时再拷到你选的目录。直接对用户目录用 `createWritable()` 会随文件变大越写越慢（实测 1ms → 1s+），因为每次提交都要处理整份已有内容。状态栏里的 `worker:opfs` 表示走了这条快路径；`worker:stream` 才是慢的退路。
 - **console 只包装一次**。反复点「开始/停止」不会层层叠加包装（曾因此导致一条日志被序列化 N 次、主线程被打满）。
 - **不做深递归序列化**。页面对象（比如 Cocos 的 `Node`）常有循环引用，`JSON.stringify` 会先遍历整棵对象图才抛错。这里只取构造函数名和浅层字段摘要，并且会截断。
 - **视图增量渲染**。新日志是追加 DOM 节点，只有切换筛选/搜索/合并时才整体重建，不会每 300ms 重建上千个节点。

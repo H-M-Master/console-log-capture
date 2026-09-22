@@ -1,36 +1,39 @@
 // 写文件工作线程。
 //
-// 为什么需要它：实测 FileSystemWritableFileStream.write() 的耗时极不稳定——
-// 中位数只有 2ms，但会偶发飙到 300ms / 700ms / 2400ms，而且和数据量无关
-// （2442ms 那次只写了 3.3KB，而 45KB 那次只花 4ms）。这是 Chrome 在做文件系统
-// 提交时被系统 I/O 阻塞。只要它发生在主线程上，整个面板和浏览器就会跟着卡。
+// 实测 createWritable() 写用户目录会随文件变大越来越慢（1ms → 1s+），
+// 因为它用交换文件，每次提交都要处理整份已有内容。createSyncAccessHandle()
+// 只对源私有文件系统（OPFS）可用，用户手选的目录用不了。
 //
-// 解决办法是把文件 I/O 整个搬到这个 worker 里：
-//   - 优先用 createSyncAccessHandle()，它是专为 worker 设计的高性能同步写入接口，
-//     没有 createWritable() 那套交换文件 + 提交的开销；
-//   - 不支持时退回 createWritable()，此时虽然仍可能有尖峰，但卡的是 worker 线程，
-//     主线程照常渲染，游戏也不受影响。
+// 所以实时写入全部进 OPFS（O(1) 追加），再定期 / 结束时一次性拷到用户目录。
+// 拷贝发生在本线程，尖峰不再打到侧边栏或游戏页面。
 //
-// 与主线程的约定（postMessage）：
-//   收 { type: 'open', dirHandle, fileName }        -> 回 { type: 'opened', mode }
-//   收 { type: 'write', text }                      -> 不回（异步落盘）
-//   收 { type: 'close' }                            -> 回 { type: 'closed', stats }
-//   收 { type: 'stats' }                            -> 回 { type: 'stats', stats }
-//   任何错误                                         -> 回 { type: 'error', message }
+// 协议：
+//   收 { type: 'open', dirHandle, fileName }  -> 回 { type: 'opened', mode }
+//   收 { type: 'write', text }                -> 不回
+//   收 { type: 'close' }                      -> 回 { type: 'closed', stats }
+//   收 { type: 'stats' }                      -> 回 { type: 'stats', stats }
+//   错                                      -> 回 { type: 'error', message }
 
-let syncHandle = null; // FileSystemSyncAccessHandle（首选）
-let writable = null; // FileSystemWritableFileStream（退路）
+let syncHandle = null;
+let writable = null;
+let destDirHandle = null;
+let destFileName = null;
+let opfsDirHandle = null;
+let opfsFileHandle = null;
 let writeOffset = 0;
+let lastCopiedSize = -1;
 let mode = 'none';
+let exportTimer = null;
 
 const encoder = new TextEncoder();
+const EXPORT_MS = 30000;
 
-// 待写队列：主线程发来的文本先进队列，由这里串行落盘，
-// 保证顺序，也避免并发写互相干扰。
 const queue = [];
 let draining = false;
+let drainPromise = null;
+let exporting = false;
+let exportPromise = null;
 
-// 统计：让主线程能知道真实的落盘开销，而不用自己计时
 const stats = {
   calls: 0,
   bytes: 0,
@@ -38,6 +41,8 @@ const stats = {
   maxMs: 0,
   queuePeak: 0,
   errors: 0,
+  exportMs: 0,
+  exportBytes: 0,
 };
 
 function resetStats() {
@@ -47,75 +52,161 @@ function resetStats() {
   stats.maxMs = 0;
   stats.queuePeak = 0;
   stats.errors = 0;
+  stats.exportMs = 0;
+  stats.exportBytes = 0;
+}
+
+async function openOpfs(fileName) {
+  const root = await navigator.storage.getDirectory();
+  opfsDirHandle = await root.getDirectoryHandle('console-capture', { create: true });
+  opfsFileHandle = await opfsDirHandle.getFileHandle(fileName, { create: true });
+  syncHandle = await opfsFileHandle.createSyncAccessHandle();
+  syncHandle.truncate(0);
+  writeOffset = 0;
+  lastCopiedSize = -1;
+  mode = 'opfs';
+}
+
+async function openStream(dirHandle, fileName) {
+  const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+  writable = await fileHandle.createWritable({ keepExistingData: false });
+  mode = 'stream';
 }
 
 async function open(dirHandle, fileName) {
-  const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+  destDirHandle = dirHandle;
+  destFileName = fileName;
+  syncHandle = null;
+  writable = null;
+  opfsFileHandle = null;
+  opfsDirHandle = null;
 
-  // 首选同步句柄：worker 专属，开销远低于 createWritable
-  if (typeof fileHandle.createSyncAccessHandle === 'function') {
+  try {
+    await openOpfs(fileName);
+    startExportTimer();
+    return mode;
+  } catch (e) {
     try {
-      syncHandle = await fileHandle.createSyncAccessHandle();
-      syncHandle.truncate(0);
-      writeOffset = 0;
-      mode = 'sync';
-      return mode;
-    } catch (e) {
-      // 某些目录（非 OPFS）不支持同步句柄，退回流式写入
-      syncHandle = null;
-    }
+      if (syncHandle) {
+        syncHandle.close();
+        syncHandle = null;
+      }
+    } catch (e2) {}
+    opfsFileHandle = null;
+    opfsDirHandle = null;
   }
 
-  writable = await fileHandle.createWritable({ keepExistingData: false });
-  mode = 'stream';
+  await openStream(dirHandle, fileName);
   return mode;
+}
+
+function startExportTimer() {
+  stopExportTimer();
+  exportTimer = setInterval(() => {
+    exportToDest(true);
+  }, EXPORT_MS);
+}
+
+function stopExportTimer() {
+  if (exportTimer) {
+    clearInterval(exportTimer);
+    exportTimer = null;
+  }
 }
 
 function enqueue(text) {
   queue.push(text);
   if (queue.length > stats.queuePeak) stats.queuePeak = queue.length;
-  drain();
+  if (!exporting) drain();
 }
 
-async function drain() {
-  if (draining) return;
+function drain() {
+  if (draining) return drainPromise;
   draining = true;
-  try {
-    while (queue.length > 0) {
-      // 一次把队列里攒的全部合并写出，减少调用次数
-      const payload = queue.join('');
-      queue.length = 0;
-      const bytes = encoder.encode(payload);
+  drainPromise = (async () => {
+    try {
+      while (queue.length > 0) {
+        const payload = queue.join('');
+        queue.length = 0;
+        const bytes = encoder.encode(payload);
+
+        const t0 = performance.now();
+        try {
+          if (syncHandle) {
+            syncHandle.write(bytes, { at: writeOffset });
+            writeOffset += bytes.byteLength;
+          } else if (writable) {
+            await writable.write(bytes);
+          } else {
+            break;
+          }
+        } catch (e) {
+          stats.errors++;
+          self.postMessage({ type: 'error', message: '写入失败：' + e.message });
+        }
+        const ms = performance.now() - t0;
+        stats.calls++;
+        stats.bytes += bytes.byteLength;
+        stats.totalMs += ms;
+        if (ms > stats.maxMs) stats.maxMs = ms;
+      }
+    } finally {
+      draining = false;
+      drainPromise = null;
+    }
+  })();
+  return drainPromise;
+}
+
+function exportToDest(reopen) {
+  if (mode !== 'opfs' || !destDirHandle || !opfsFileHandle) return Promise.resolve();
+  if (exporting) return exportPromise || Promise.resolve();
+  exporting = true;
+  exportPromise = (async () => {
+    try {
+      if (drainPromise) await drainPromise;
+      await drain();
+      if (writeOffset === lastCopiedSize) return;
 
       const t0 = performance.now();
-      try {
-        if (syncHandle) {
-          syncHandle.write(bytes, { at: writeOffset });
-          writeOffset += bytes.byteLength;
-        } else if (writable) {
-          await writable.write(bytes);
-        } else {
-          break; // 还没 open 或已 close，丢弃
-        }
-      } catch (e) {
-        stats.errors++;
-        self.postMessage({ type: 'error', message: '写入失败：' + e.message });
+      if (syncHandle) {
+        syncHandle.flush();
+        syncHandle.close();
+        syncHandle = null;
       }
-      const ms = performance.now() - t0;
-      stats.calls++;
-      stats.bytes += bytes.byteLength;
-      stats.totalMs += ms;
-      if (ms > stats.maxMs) stats.maxMs = ms;
+
+      const blob = await opfsFileHandle.getFile();
+      const dest = await destDirHandle.getFileHandle(destFileName, { create: true });
+      const w = await dest.createWritable({ keepExistingData: false });
+      await blob.stream().pipeTo(w);
+      lastCopiedSize = blob.size;
+      stats.exportMs += performance.now() - t0;
+      stats.exportBytes += blob.size;
+
+      if (reopen) {
+        syncHandle = await opfsFileHandle.createSyncAccessHandle();
+        writeOffset = syncHandle.getSize();
+      }
+    } catch (e) {
+      stats.errors++;
+      self.postMessage({ type: 'error', message: '拷贝到用户目录失败：' + e.message });
+    } finally {
+      exporting = false;
+      exportPromise = null;
+      drain();
     }
-  } finally {
-    draining = false;
-  }
+  })();
+  return exportPromise;
 }
 
 async function close() {
-  // 把队列里剩下的写完再关，否则会丢尾部日志
+  stopExportTimer();
+  if (exportPromise) await exportPromise;
   await drain();
   try {
+    if (mode === 'opfs') {
+      await exportToDest(false);
+    }
     if (syncHandle) {
       syncHandle.flush();
       syncHandle.close();
@@ -127,6 +218,7 @@ async function close() {
     }
   } catch (e) {
     stats.errors++;
+    self.postMessage({ type: 'error', message: '关闭文件失败：' + e.message });
   }
   mode = 'none';
 }
@@ -149,7 +241,7 @@ self.onmessage = async (e) => {
     }
 
     if (msg.type === 'stats') {
-      const snapshot = { ...stats, mode, queued: queue.length };
+      const snapshot = { ...stats, mode, queued: queue.length, offset: writeOffset };
       resetStats();
       self.postMessage({ type: 'stats', stats: snapshot });
       return;
