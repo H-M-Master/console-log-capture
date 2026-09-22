@@ -12,3 +12,7 @@ Thumbs.db
 
 # 日志
 *.log
+
+# 测试用独立 Chrome 用户目录
+chrome-test-profile/
+cdp9333.json

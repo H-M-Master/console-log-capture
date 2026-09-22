@@ -35,6 +35,30 @@ let diagWriter = null;
 let diagTimer = null;
 let diagFileNote = '';
 // 自动降级动作只做一次，避免反复切来切去
+function persistToggles() {
+  try {
+    localStorage.setItem(
+      'cc-toggles',
+      JSON.stringify({
+        muteNative: muteNativeToggle.checked,
+        fileOnly: fileOnlyToggle.checked,
+      })
+    );
+  } catch (e) {}
+}
+
+function restoreToggles() {
+  try {
+    const raw = localStorage.getItem('cc-toggles');
+    if (!raw) return;
+    const t = JSON.parse(raw);
+    if (typeof t.muteNative === 'boolean') muteNativeToggle.checked = t.muteNative;
+    if (typeof t.fileOnly === 'boolean') fileOnlyToggle.checked = t.fileOnly;
+  } catch (e) {}
+}
+
+restoreToggles();
+
 const autoActions = { mutedNative: false, forcedFileOnly: false, clampedView: false, slowedWrites: false };
 
 function diagLog(text) {
@@ -54,20 +78,22 @@ async function autoRemediate(result) {
     changed.push('已自动降低落盘频率（单次写入开销过高）');
   }
 
-  // 对策 1：原生 console 太贵 → 自动静音
-  if (!autoActions.mutedNative && result.stats.avgNativePct > 40) {
+  // 对策 1：原生 console 太贵，或拖角色时日志暴涨（实测 100~250 条/秒就会卡）
+  if (!autoActions.mutedNative && (result.stats.avgNativePct > 40 || result.stats.avgRate > 80)) {
     autoActions.mutedNative = true;
     muteNativeToggle.checked = true;
+    persistToggles();
     await pushConfigToPage();
-    changed.push('已自动开启静音（原生 console 开销过高）');
+    changed.push('已自动开启静音（原生 console 开销过高或日志暴涨）');
   }
 
-  // 对策 2：插件本身占主线程过多 → 自动切只落盘
-  if (!autoActions.forcedFileOnly && result.stats.avgPluginPct > 15) {
+  // 对策 2：采集占主线程过多，或日志暴涨时侧边栏实时刷新会卡
+  if (!autoActions.forcedFileOnly && (result.stats.avgPluginPct > 15 || result.stats.avgRate > 80)) {
     autoActions.forcedFileOnly = true;
     fileOnlyToggle.checked = true;
+    persistToggles();
     await pushConfigToPage();
-    changed.push('已自动切换为只落盘（采集本身占用过高）');
+    changed.push('已自动切换为只落盘（日志暴涨时不刷侧边栏）');
   }
 
   // 对策 3：视图出问题 → 自动收紧视图上限并重建
@@ -1075,8 +1101,12 @@ async function pushConfigToPage() {
   }
 }
 
-muteNativeToggle.addEventListener('change', pushConfigToPage);
+muteNativeToggle.addEventListener('change', () => {
+  persistToggles();
+  pushConfigToPage();
+});
 fileOnlyToggle.addEventListener('change', () => {
+  persistToggles();
   if (fileOnlyToggle.checked) {
     setStatus('只落盘模式：日志不再显示在侧边栏，仅写入文件；已停止采集时可重新「开始」以获得干净的文件', 'running');
   } else {
