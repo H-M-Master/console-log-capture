@@ -25,6 +25,7 @@ const nextErrorBtn = document.getElementById('nextErrorBtn');
 const diagBtn = document.getElementById('diagBtn');
 const overheadEl = document.getElementById('overhead');
 const muteNativeToggle = document.getElementById('muteNativeToggle');
+const liveErrorsToggle = document.getElementById('liveErrorsToggle');
 const fileOnlyToggle = document.getElementById('fileOnlyToggle');
 const diagInfoEl = document.getElementById('diagInfo');
 
@@ -41,6 +42,7 @@ function persistToggles() {
       'cc-toggles',
       JSON.stringify({
         muteNative: muteNativeToggle.checked,
+        liveErrorsOnly: liveErrorsToggle.checked,
         fileOnly: fileOnlyToggle.checked,
       })
     );
@@ -53,7 +55,13 @@ function restoreToggles() {
     if (!raw) return;
     const t = JSON.parse(raw);
     if (typeof t.muteNative === 'boolean') muteNativeToggle.checked = t.muteNative;
+    if (typeof t.liveErrorsOnly === 'boolean') liveErrorsToggle.checked = t.liveErrorsOnly;
     if (typeof t.fileOnly === 'boolean') fileOnlyToggle.checked = t.fileOnly;
+    // 旧版默认勾了「只落盘」，会把实时错误也关掉。迁到「实时仅错误」。
+    if (t.liveErrorsOnly === undefined && t.fileOnly === true) {
+      liveErrorsToggle.checked = true;
+      fileOnlyToggle.checked = false;
+    }
   } catch (e) {}
 }
 
@@ -78,7 +86,7 @@ async function autoRemediate(result) {
     changed.push('已自动降低落盘频率（单次写入开销过高）');
   }
 
-  // 对策 1：原生 console 太贵，或拖角色时日志暴涨（实测 100~250 条/秒就会卡）
+  // 对策 1：原生 console 太贵，或拖角色时日志暴涨
   if (!autoActions.mutedNative && (result.stats.avgNativePct > 40 || result.stats.avgRate > 80)) {
     autoActions.mutedNative = true;
     muteNativeToggle.checked = true;
@@ -87,13 +95,14 @@ async function autoRemediate(result) {
     changed.push('已自动开启静音（原生 console 开销过高或日志暴涨）');
   }
 
-  // 对策 2：采集占主线程过多，或日志暴涨时侧边栏实时刷新会卡
+  // 对策 2：日志暴涨时 Info 刷屏会卡，但错误仍要实时看见
   if (!autoActions.forcedFileOnly && (result.stats.avgPluginPct > 15 || result.stats.avgRate > 80)) {
     autoActions.forcedFileOnly = true;
-    fileOnlyToggle.checked = true;
+    liveErrorsToggle.checked = true;
+    fileOnlyToggle.checked = false;
     persistToggles();
     await pushConfigToPage();
-    changed.push('已自动切换为只落盘（日志暴涨时不刷侧边栏）');
+    changed.push('已自动改为实时仅错误/警告（Info 洪峰不刷侧边栏，错误仍立刻显示）');
   }
 
   // 对策 3：视图出问题 → 自动收紧视图上限并重建
@@ -693,12 +702,12 @@ function mainWorldCapture() {
 
   // 采集配置：由侧边栏通过 postMessage 下发（避免每次改配置都重新注入脚本）
   const cfg = {
-    // 静音：不调用原生 console，只采集到文件。
-    // 开着 DevTools 时原生 console 是开销大头（抓栈、格式化、面板留存对象）。
+    // 静音：不调用原生 console。拖角色时这条是卡顿主因。
     muteNative: false,
-    // 只落盘：不把日志明细送给侧边栏，只送纯文本供写文件。
-    // 适合"日志量极大、只需要事后看文件"的场景。
+    // 完全不刷侧边栏，只送纯文本写文件。
     fileOnly: false,
+    // 侧边栏只收 error/warn；全文仍以纯文本落盘。Info 洪峰不克隆、不刷 DOM。
+    liveErrorsOnly: false,
   };
   window.__ccCfg = cfg;
 
@@ -776,22 +785,27 @@ function mainWorldCapture() {
     } catch (err) {}
   });
 
+  function isHotLevel(level) {
+    return level === 'error' || level === 'warn' || level === 'uncaught-exception' || level === 'unhandled-rejection';
+  }
+
   function flush() {
     if (!window.__ccRunning) return;
     const t0 = performance.now();
-    // 循环排空：每次最多搬 MAX_BATCH 条，避免单个巨型批次，
-    // 但也不让日志在缓冲里积压（有上限保护，最多转几次就空了）。
     for (let i = 0; i < 20; i++) {
       const batch = ringDrain(MAX_BATCH);
       if (!batch || batch.length === 0) break;
 
-      // 只落盘模式：批量攒成文本，通过一个轻量的字符串消息送出去，
-      // 不再走对象数组的结构化克隆（几万条时那个克隆才是真的贵）。
-      const payload = cfg.fileOnly ? formatBatchToText(batch) : { __ccBatch: true, batch };
       try {
-        window.postMessage(cfg.fileOnly ? { __ccBatchText: payload } : payload, '*');
+        // 全文始终以纯文本落盘（结构化克隆对象数组才贵）
+        if (cfg.fileOnly || cfg.liveErrorsOnly) {
+          window.postMessage({ __ccBatchText: formatBatchToText(batch) }, '*');
+        }
+        if (!cfg.fileOnly) {
+          const live = cfg.liveErrorsOnly ? batch.filter((b) => isHotLevel(b.level)) : batch;
+          if (live.length) window.postMessage({ __ccBatch: true, batch: live }, '*');
+        }
       } catch (err) {
-        // postMessage 失败（理论上不会）时直接丢弃这一批，不重试堆积
         break;
       }
       if (batch.length < MAX_BATCH) break;
@@ -898,6 +912,7 @@ function mainWorldCapture() {
     if (d.__ccSetConfig) {
       if (typeof d.muteNative === 'boolean') cfg.muteNative = d.muteNative;
       if (typeof d.fileOnly === 'boolean') cfg.fileOnly = d.fileOnly;
+      if (typeof d.liveErrorsOnly === 'boolean') cfg.liveErrorsOnly = d.liveErrorsOnly;
       reportStats();
     }
   });
@@ -976,8 +991,10 @@ async function appendBatch(batch) {
     const row = { level: entry.level, category, text: entry.text, time: entry.time, count: 1, seq: nextSeq++ };
 
     categoryCounts[category]++;
-    totalCount++;
-    rateWindowCount++;
+    if (!liveErrorsToggle.checked) {
+      totalCount++;
+      rateWindowCount++;
+    }
 
     // 追加到视图数组，超出上限时从头部丢弃（DOM 会在渲染时同步裁剪）
     displayRows.push(row);
@@ -997,10 +1014,10 @@ async function appendBatch(batch) {
   }
 
   updateStatsBar();
-  // 视图按节流渲染，不做全量重建
   scheduleRender(false);
 
-  if (writeWorker || writable) {
+  // 实时仅错误时，全文已经由文本通道落盘，这里只刷新视图，避免写两遍
+  if ((writeWorker || writable) && !liveErrorsToggle.checked && !fileOnlyToggle.checked) {
     enqueueWrite(fileLines.join('\n') + '\n');
   }
 }
@@ -1089,6 +1106,7 @@ async function pushConfigToPage() {
     const cfg = {
       muteNative: muteNativeToggle.checked,
       fileOnly: fileOnlyToggle.checked,
+      liveErrorsOnly: liveErrorsToggle.checked,
     };
     await chrome.scripting.executeScript({
       target: { tabId: targetTabId },
@@ -1105,12 +1123,24 @@ muteNativeToggle.addEventListener('change', () => {
   persistToggles();
   pushConfigToPage();
 });
+liveErrorsToggle.addEventListener('change', () => {
+  persistToggles();
+  pushConfigToPage();
+  if (liveErrorsToggle.checked && fileOnlyToggle.checked) {
+    fileOnlyToggle.checked = false;
+    persistToggles();
+  }
+  setStatus(
+    liveErrorsToggle.checked
+      ? '实时仅错误/警告：Info 不刷侧边栏，错误出现会立刻显示；完整日志仍写入文件'
+      : '侧边栏显示全部级别（拖角色时可能卡）',
+    'running'
+  );
+});
 fileOnlyToggle.addEventListener('change', () => {
   persistToggles();
   if (fileOnlyToggle.checked) {
-    setStatus('只落盘模式：日志不再显示在侧边栏，仅写入文件；已停止采集时可重新「开始」以获得干净的文件', 'running');
-  } else {
-    setStatus('已关闭只落盘模式', 'stopped');
+    setStatus('完全不刷侧边栏：日志只写入文件', 'running');
   }
   pushConfigToPage();
 });
@@ -1202,7 +1232,7 @@ async function startDiagWriter(handle) {
     diagLog('采集开始');
     diagLog(`阈值：${JSON.stringify(window.CCDiag.THRESHOLDS)}`);
     diagLog(
-      `配置：静音=${muteNativeToggle.checked} 只落盘=${fileOnlyToggle.checked} ` +
+      `配置：静音=${muteNativeToggle.checked} 实时仅错误=${liveErrorsToggle.checked} 不刷侧边栏=${fileOnlyToggle.checked} ` +
         `视图上限=${MAX_DISPLAY_ROWS} 页面缓冲上限=2000 单批=500`
     );
   } catch (e) {
