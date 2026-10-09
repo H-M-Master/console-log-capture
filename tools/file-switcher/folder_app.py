@@ -22,7 +22,9 @@ from typing import Any, Callable
 # Resources stay beside the source files, or beside the frozen executable.  All
 # mutable metadata, snapshots, journals and logs live in the per-user data root.
 if getattr(sys, "frozen", False):
-    RESOURCE_ROOT = Path(sys.executable).resolve().parent
+    # onefile extracts bundled payload into a one-shot temp dir (_MEIPASS);
+    # onedir keeps it next to the executable. Prefer _MEIPASS when present.
+    RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
 else:
     RESOURCE_ROOT = Path(__file__).resolve().parent
 
@@ -202,22 +204,81 @@ class FolderApp(tk.Tk):
         return combo
 
     def _build_ui(self) -> None:
-        header = ttk.Frame(self, padding=(16, 13, 16, 5)); header.pack(fill="x")
-        ttk.Label(header, text="文件夹状态切换", style="Title.TLabel").pack(side="left")
-        self.state_label = ttk.Label(header, text="尚未读取", style="State.TLabel"); self.state_label.pack(side="right")
+        self._build_simple_home()
+        self.advanced_frame = ttk.Frame(self)
+        self._build_advanced(self.advanced_frame)
+        self._show_simple()
 
-        selectors = ttk.Frame(self, padding=(16, 0, 16, 8)); selectors.pack(fill="x")
+    def _show_simple(self) -> None:
+        if self.advanced_frame.winfo_ismapped():
+            self.advanced_frame.pack_forget()
+        self.simple_frame.pack(fill="both", expand=True)
+        self._refresh_simple()
+
+    def _show_advanced(self) -> None:
+        self.simple_frame.pack_forget()
+        self.advanced_frame.pack(fill="both", expand=True)
+
+    def _build_simple_home(self) -> None:
+        self.simple_frame = ttk.Frame(self, padding=24)
+        ttk.Label(self.simple_frame, text="文件版本切换", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(self.simple_frame, text="在你保存的几个版本之间一键切换。只有你勾选的文件会被替换，其它文件不动。",
+                  wraplength=640).pack(anchor="w", pady=(4, 14))
+        self.simple_current = ttk.Label(self.simple_frame, text="正在读取…", style="State.TLabel")
+        self.simple_current.pack(anchor="w", pady=(0, 12))
+        self.simple_buttons = ttk.Frame(self.simple_frame)
+        self.simple_buttons.pack(fill="x", pady=(0, 16))
+        bottom = ttk.Frame(self.simple_frame)
+        bottom.pack(fill="x")
+        self._button(bottom, "设置 / 添加版本", self.start_wizard).pack(side="left")
+        self._button(bottom, "高级管理", self._show_advanced).pack(side="right")
+
+    def _refresh_simple(self) -> None:
+        for child in self.simple_buttons.winfo_children():
+            child.destroy()
+        profile = self.selected_profile()
+        states = (profile.get("states") or []) if profile else []
+        ready = [s for s in states if s.get("snapshotRoot") and not s.get("needsCapture")]
+        if not ready:
+            self.simple_current.configure(text="还没有可用的版本。点下面“设置 / 添加版本”开始。", style="Warn.TLabel")
+            return
+        current_name = "未匹配任何版本"
+        if self._last_status:
+            mode = str(self._last_status.get("currentMode", ""))
+            match = next((s for s in states if str(s.get("id")) == mode), None)
+            if match:
+                current_name = match.get("name", mode)
+        self.simple_current.configure(text=f"当前：{current_name}", style="Good.TLabel")
+        for state in ready:
+            name = state.get("name", state.get("id"))
+            ttk.Button(self.simple_buttons, text=f"切换到：{name}",
+                       command=lambda s=state: self._simple_switch(s)).pack(fill="x", pady=4)
+
+    def _simple_switch(self, state: dict[str, Any]) -> None:
+        name = state.get("name", state.get("id"))
+        if not messagebox.askyesno("确认切换", f"切换到“{name}”？\n只会替换你勾选管理的文件，其它文件保持不动。", parent=self):
+            return
+        label = f"{state.get('name', state.get('id'))} [{state.get('id')}]"
+        self.state_var.set(label)
+        self.apply_selected_state()
+
+    def _build_advanced(self, parent: ttk.Frame) -> None:
+        header = ttk.Frame(parent, padding=(16, 13, 16, 5)); header.pack(fill="x")
+        ttk.Label(header, text="高级管理", style="Title.TLabel").pack(side="left")
+        self.state_label = ttk.Label(header, text="尚未读取", style="State.TLabel"); self.state_label.pack(side="right")
+        self._button(header, "返回简单模式", self._show_simple).pack(side="right", padx=8)
+
+        selectors = ttk.Frame(parent, padding=(16, 0, 16, 8)); selectors.pack(fill="x")
         ttk.Label(selectors, text="方案：").pack(side="left")
         self.profile_var = tk.StringVar(); self.profile_box = self._combo(selectors, self.profile_var, width=33)
         self.profile_box.pack(side="left", padx=(6, 14)); self.profile_box.bind("<<ComboboxSelected>>", self.on_profile_changed)
-        ttk.Label(selectors, text="状态：").pack(side="left")
+        ttk.Label(selectors, text="版本：").pack(side="left")
         self.state_var = tk.StringVar(); self.state_box = self._combo(selectors, self.state_var, width=25)
         self.state_box.pack(side="left", padx=(6, 14)); self.state_box.bind("<<ComboboxSelected>>", self.on_state_changed)
         self._button(selectors, "重新加载", self.load_config).pack(side="right")
-        self._button(selectors, "首次设置向导", self.start_wizard).pack(side="right", padx=8)
-        self._button(selectors, "打开工具目录", self.open_tool_dir).pack(side="right", padx=8)
+        self._button(selectors, "添加版本向导", self.start_wizard).pack(side="right", padx=8)
 
-        self.tabs = ttk.Notebook(self); self.tabs.pack(fill="both", expand=True, padx=14, pady=4)
+        self.tabs = ttk.Notebook(parent); self.tabs.pack(fill="both", expand=True, padx=14, pady=4)
         self.status_tab = ttk.Frame(self.tabs, padding=12); self.scan_tab = ttk.Frame(self.tabs, padding=12)
         self.diff_tab = ttk.Frame(self.tabs, padding=12); self.capture_tab = ttk.Frame(self.tabs, padding=12)
         self.log_tab = ttk.Frame(self.tabs, padding=12)
@@ -769,6 +830,7 @@ class FolderApp(tk.Tk):
             self.status_tree.insert("", "end", values=(state.get("id", ""), state.get("name", ""), "是" if state.get("exact") else "否", state.get("fileCount", "-"), error))
         self.cache_label.configure(text="缓存目录：" + ", ".join(map(str, data.get("cacheDirectories", []) or [])))
         self.process_label.configure(text="占用进程：" + ", ".join(map(str, data.get("blockedProcesses", []) or [])) if data.get("blockedProcesses") else "占用进程：无")
+        self._refresh_simple()
         self._update_apply_button()
 
     def render_diff(self, data: dict[str, Any]) -> None:
