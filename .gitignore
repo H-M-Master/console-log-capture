@@ -16,3 +16,18 @@ Thumbs.db
 # 测试用独立 Chrome 用户目录
 chrome-test-profile/
 cdp9333.json
+
+# 文件切换器运行时状态和 GUI 日志
+tools/file-switcher/state/
+tools/file-switcher/folder-data/
+tools/file-switcher/snapshots/
+tools/file-switcher/__pycache__/
+tools/file-switcher/tests/__pycache__/
+tools/file-switcher/gui/__pycache__/
+tools/file-switcher/build/
+tools/file-switcher/*.bak
+tools/file-switcher/*.bak.*
+tools/file-switcher/config.json
+tools/file-switcher/folder-config.json
+**/__pycache__/
+*.py[cod]

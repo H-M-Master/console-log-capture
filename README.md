@@ -77,6 +77,21 @@ console-extension/     ← 加载扩展时选这个文件夹
 LICENSE
 ```
 
+## 通用文件切换工具
+
+仓库还包含一个可配置的双版本文件切换器，适合在自动化版和日常测试版之间切换 Cocos 或其他本地文件。工具位于 [`tools/file-switcher`](tools/file-switcher/)，不会把替换文件数量写死。
+
+```powershell
+cd tools/file-switcher
+.\switch-files.ps1 -Status
+.\switch-files.ps1 -Mode automation -DryRun
+.\switch-files.ps1 -Mode daily
+```
+
+要增加、删除或调整替换文件，请编辑 `tools/file-switcher/config.json` 的 `entries` 和 `snapshots`；完整说明见 [`tools/file-switcher/README.md`](tools/file-switcher/README.md)。正式切换前请关闭 Cocos Creator，并先运行 `-Status` / `-DryRun`。
+
+图形界面位于 [`tools/file-switcher/gui`](tools/file-switcher/gui/)，双击 `run.cmd` 启动。它提供状态首页、预演/切换、任意文件配置、模式管理基础功能和事务日志查看；GUI 不直接改引擎文件，实际操作仍由 PowerShell 核心完成。
+
 ## License
 
 [MIT](LICENSE)
