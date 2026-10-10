@@ -13,6 +13,10 @@ Thumbs.db
 # 日志
 *.log
 
+# 打包产物：只保留单文件版 FolderSwitcher.exe，其余构建中间物不入库
+tools/file-switcher/dist/*
+!tools/file-switcher/dist/FolderSwitcher.exe
+
 # 测试用独立 Chrome 用户目录
 chrome-test-profile/
 cdp9333.json
