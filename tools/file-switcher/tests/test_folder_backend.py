@@ -12,7 +12,7 @@ SCRIPT = ROOT / "folder-switcher.ps1"
 def run_backend(config, action, **kwargs):
     command = [
         "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+        "-ExecutionPolicy", "RemoteSigned", "-File", str(SCRIPT),
         "-Config", str(config),
     ]
     for key, value in kwargs.items():
@@ -196,7 +196,9 @@ class FolderBackendTests(unittest.TestCase):
         self._write_config(["../escape.txt"])
         proc, payload = self._run("Status")
         self.assertNotEqual(proc.returncode, 0)
-        self.assertEqual(payload["error"]["code"], "operation-failed")
+        # The specific code, not the blanket fallback: the GUI keys its
+        # user-facing explanation off this value.
+        self.assertEqual(payload["error"]["code"], "path-unsafe-relative")
 
 
 if __name__ == "__main__":
