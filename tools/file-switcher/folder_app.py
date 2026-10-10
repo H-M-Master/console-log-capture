@@ -166,8 +166,11 @@ class FolderApp(tk.Tk):
         self._busy = False
         self._pending_action = ""
         self._pending_capture: tuple[str, str | None] | None = None
-        self._pending_apply = False
-        self._apply_requested = False
+        # What to do once the Diff result arrives: "" / "preview" / "apply".
+        self._after_diff = ""
+        # True when the click already came from the one-click home screen, so
+        # the advanced confirmation dialog is skipped.
+        self._from_simple = False
         self._last_plan: dict[str, Any] | None = None
         self._last_status: dict[str, Any] | None = None
         self._controls: list[tk.Widget] = []
@@ -239,20 +242,25 @@ class FolderApp(tk.Tk):
         profile = self.selected_profile()
         states = (profile.get("states") or []) if profile else []
         ready = [s for s in states if s.get("snapshotRoot") and not s.get("needsCapture")]
+        status_rows = (self._last_status.get("states") or []) if self._last_status else []
+        exact_row = next((r for r in status_rows if r.get("exact")), None)
+        exact_id = str(exact_row.get("id")) if exact_row else ""
+        exact_name = (exact_row.get("name") or exact_row.get("id")) if exact_row else ""
         if not ready:
             self.simple_current.configure(text="还没有可用的版本。点下面“设置 / 添加版本”开始。", style="Warn.TLabel")
             return
-        current_name = "未匹配任何版本"
-        if self._last_status:
-            mode = str(self._last_status.get("currentMode", ""))
-            match = next((s for s in states if str(s.get("id")) == mode), None)
-            if match:
-                current_name = match.get("name", mode)
-        self.simple_current.configure(text=f"当前：{current_name}", style="Good.TLabel")
+        self.simple_current.configure(
+            text=f"当前版本：{exact_name}" if exact_name else "当前版本：还没有匹配到",
+            style="Good.TLabel" if exact_name else "Warn.TLabel")
         for state in ready:
             name = state.get("name", state.get("id"))
-            ttk.Button(self.simple_buttons, text=f"切换到：{name}",
-                       command=lambda s=state: self._simple_switch(s)).pack(fill="x", pady=4)
+            is_current = str(state.get("id")) == exact_id
+            label = f"✓ 当前：{name}（再次点击可重新确认）" if is_current else f"切换到：{name}"
+            btn = ttk.Button(self.simple_buttons, text=label,
+                             command=lambda s=state: self._simple_switch(s))
+            btn.pack(fill="x", pady=4)
+            if self._busy:
+                btn.configure(state="disabled")
 
     def _simple_switch(self, state: dict[str, Any]) -> None:
         name = state.get("name", state.get("id"))
@@ -260,6 +268,9 @@ class FolderApp(tk.Tk):
             return
         label = f"{state.get('name', state.get('id'))} [{state.get('id')}]"
         self.state_var.set(label)
+        # Already confirmed on the home screen; the advanced-screen dialog is
+        # parented to a hidden window and would look like nothing happened.
+        self._from_simple = True
         self.apply_selected_state()
 
     def _build_advanced(self, parent: ttk.Frame) -> None:
@@ -474,13 +485,23 @@ class FolderApp(tk.Tk):
                 self.state_var.set(next((f"{s.get('name', s.get('id'))} [{s.get('id')}]" for s in (self.selected_profile() or {}).get("states", []) if str(s.get("id")) == sid), sid))
 
     def preview_selected_state(self) -> None:
-        if self.selected_state_id(): self.diff()
+        if self.selected_state_id(): self._from_simple = False; self._request_diff("preview")
 
     def apply_selected_state(self) -> None:
-        if self.selected_state_id(): self.apply()
+        if self.selected_state_id(): self._request_diff("apply")
 
     def capture_selected_state(self) -> None:
         if self.selected_state_id(): self.capture_current()
+
+    def _request_diff(self, after: str) -> None:
+        """Run a fresh Diff and remember what to do with the result."""
+        state = self.selected_state_id()
+        if not state: messagebox.showwarning("没有状态", "请先选择状态。"); return
+        extras = ["-StateId", state]
+        if self.unknown_var.get(): extras.append("-AllowUnknown")
+        if self.delete_var.get(): extras.append("-AllowManagedDelete")
+        self._after_diff = after
+        self.call(self._args("Diff", *extras), "diff")
 
     def _save_metadata(self, data: dict[str, Any] | None = None) -> bool:
         try:
@@ -622,10 +643,10 @@ class FolderApp(tk.Tk):
         args.extend(str(x) for x in extra if x is not None)
         return args
 
-    def call(self, args: list[str], action: str, pending_apply: bool = False) -> bool:
+    def call(self, args: list[str], action: str) -> bool:
         if self._busy or getattr(self.runner, "running", False):
             messagebox.showwarning("操作进行中", "请等待当前操作结束。"); return False
-        self._busy = True; self._pending_action = action; self._pending_apply = pending_apply
+        self._busy = True; self._pending_action = action
         self._set_busy(True); self._append_log(f"\n> {action}: {' '.join(args)}\n")
         try:
             try:
@@ -647,45 +668,42 @@ class FolderApp(tk.Tk):
         if root: self.call(self._args("Scan", "-SourceRoot", root), "scan")
 
     def diff(self) -> None:
-        state = self.selected_state_id()
-        if not state: messagebox.showwarning("没有状态", "请先选择状态。"); return
-        extras = ["-StateId", state]
-        if self.unknown_var.get(): extras.append("-AllowUnknown")
-        if self.delete_var.get(): extras.append("-AllowManagedDelete")
-        self.call(self._args("Diff", *extras), "diff")
+        """Advanced screen: preview only."""
+        self._from_simple = False
+        self._request_diff("preview")
 
     def apply(self) -> None:
-        state = self.selected_state_id()
-        if not state:
-            messagebox.showwarning("没有状态", "请先选择状态。")
-            return
-        # Apply is always digest-guarded and starts with a fresh Diff.
-        self._apply_requested = True
-        self._pending_apply = True
-        self.diff()
+        """Advanced screen: apply, still guarded by a fresh Diff + digest."""
+        self._request_diff("apply")
 
     def _apply_plan_after_preview(self) -> None:
         plan = self._last_plan
-        if not plan: return
+        from_simple = self._from_simple
+        self._from_simple = False
+        if not plan:
+            return
         blockers = plan.get("blockers") or []
         if blockers:
-            messagebox.showerror("计划被阻止", "\n".join(str(x) for x in blockers)); self._pending_apply = False; self._apply_requested = False; return
+            messagebox.showerror("计划被阻止", "\n".join(str(x) for x in blockers)); return
         if not plan.get("planDigest"):
-            messagebox.showwarning("无法应用", "计划没有 digest；请重新生成差异预览。", parent=self)
-            self._pending_apply = False
-            self._apply_requested = False
-            return
-        if self.dry_var.get() and not self._apply_requested:
+            messagebox.showwarning("无法应用", "计划没有 digest；请重新生成差异预览。", parent=self); return
+        # The advanced screen's "preview only" checkbox stays meaningful there;
+        # the one-click home screen ignores it because the user already chose.
+        if self.dry_var.get() and not from_simple:
             self.plan_label.configure(text=self.plan_label.cget("text") + "\n当前为仅预览，未修改文件。")
-            self._pending_apply = False
-            self._apply_requested = False
             return
-        if not messagebox.askyesno("确认应用", "将按上方计划修改受管文件；未管理文件不受影响。继续吗？", parent=self):
-            self._pending_apply = False; self._apply_requested = False; return
-        state = self.selected_state_id(); extras = ["-StateId", state or "", "-ExpectedPlanDigest", str(plan.get("planDigest", ""))]
+        if from_simple:
+            confirmed = messagebox.askyesno(
+                "确认切换", "确认按上面计划切换？\n只会替换你勾选管理的文件，其它文件保持不动。", parent=self)
+        else:
+            confirmed = messagebox.askyesno(
+                "确认应用", "将按上方计划修改受管文件；未管理文件不受影响。继续吗？", parent=self)
+        if not confirmed:
+            return
+        state = self.selected_state_id()
+        extras = ["-StateId", state or "", "-ExpectedPlanDigest", str(plan.get("planDigest", ""))]
         if self.unknown_var.get(): extras.append("-AllowUnknown")
         if self.delete_var.get(): extras.append("-AllowManagedDelete")
-        self._apply_requested = False
         self.call(self._args("Apply", *extras), "apply")
 
     def capture_current(self) -> None:
@@ -806,7 +824,14 @@ class FolderApp(tk.Tk):
                     if source: extras += ["-SourceRoot", source]
                     self._pending_capture = None; self.call(self._args("Capture", *extras), "capture")
                 else: self._pending_capture = None
-        elif action == "diff": self.render_diff(data); self._last_plan = data; self._last_status = None; self.state_label.configure(text="计划已生成，当前状态需重新确认", style="Warn.TLabel"); self._pending_action = ""; self._apply_plan_after_preview() if self._pending_apply else None
+        elif action == "diff":
+            self.render_diff(data); self._last_plan = data; self._pending_action = ""
+            after = self._after_diff; self._after_diff = ""
+            if after == "apply":
+                self.state_label.configure(text="计划已生成，等待确认", style="Warn.TLabel")
+                self._apply_plan_after_preview()
+            else:
+                self.state_label.configure(text="仅预览，未修改文件", style="Warn.TLabel")
         elif action == "capture":
             self.capture_info.configure(text=f"采集完成：{data.get('fileCount', 0)} 个文件，缺失 {data.get('missingCount', 0)} 个。快照可供状态查看。")
             self._pending_capture = None; self.refresh_status()
@@ -899,6 +924,13 @@ class FolderApp(tk.Tk):
             except (tk.TclError, AttributeError): pass
         try: self.tabs.configure(state="disabled" if busy else "normal")
         except tk.TclError: pass
+        # The home-screen version buttons are rebuilt dynamically, so they are
+        # not in _controls; keep them in step with the busy flag as well.
+        try:
+            for child in self.simple_buttons.winfo_children():
+                child.configure(state="disabled" if busy else "normal")
+        except (tk.TclError, AttributeError):
+            pass
 
     def _append_log(self, text: str) -> None:
         self._write_text_log(text)
