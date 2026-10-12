@@ -117,17 +117,27 @@ class App(tk.Tk):
 
     # ---------- configuration ----------
     def load_config(self, show_error: bool = True) -> None:
-        """Load metadata, or fall back to an empty document on first run."""
+        """Load metadata, or fall back to an empty document on first run.
+
+        Keeps the current selection when it still exists in the reloaded
+        document, so a background reload (after a capture, say) does not move
+        the user to a different version.
+        """
+        wanted_profile, wanted_state = self._active_profile_id, self._active_state_id
         try:
             self.config_data = self.store.load()
             self._config_hash = self.store.current_hash()
             self.config = Config(self.config_data, self.config_path.parent)
-            self._active_profile_id = self.config.initial_profile_id()
+            if not self.config.profile(wanted_profile):
+                wanted_profile = self.config.initial_profile_id()
+            self._active_profile_id = wanted_profile
             if not self.config.is_empty:
                 states = self.config.states(self._active_profile_id)
-                captured = [s for s in states
-                            if self.config.is_captured(self._active_profile_id, s.id)]
-                self._active_state_id = (captured or states)[0].id if (captured or states) else ""
+                if not any(s.id == wanted_state for s in states):
+                    captured = [s for s in states
+                                if self.config.is_captured(self._active_profile_id, s.id)]
+                    wanted_state = (captured or states)[0].id if (captured or states) else ""
+                self._active_state_id = wanted_state
             else:
                 self._active_state_id = ""
             self._sync_selectors()
@@ -814,6 +824,10 @@ class App(tk.Tk):
                 text=f"已保存 {data.get('fileCount', 0)} 个文件"
                      f"（缺失 {data.get('missingCount', 0)} 个）。现在可以切换到它了。")
             self._pending_capture = None
+            # Capture writes the snapshot path into the config file, so the
+            # in-memory copy is stale until it is read back.  Without this the
+            # home screen keeps showing "no saved content" after saving.
+            self.load_config(show_error=False)
             self.refresh_status()
             self.show_home()
         elif action == "apply":
