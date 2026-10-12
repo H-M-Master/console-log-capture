@@ -145,10 +145,6 @@ class HomeView(ttk.Frame):
         except tk.TclError:
             pass
 
-    def flash(self, text: str, style: str = "Warn.TLabel") -> None:
-        """One-line feedback under the title, used after a switch."""
-        self.current.configure(text=text, style=style)
-
 
 def ask_switch(parent: tk.Misc, name: str, changed: int | None = None) -> bool:
     """The single confirmation on the happy path."""

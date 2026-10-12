@@ -322,9 +322,9 @@ class App(tk.Tk):
         if not dialogs.confirm_switch(self, name):
             return
         self._set_active_state(state_id)
-        self._switch_confirmed = True
-        self._intent = INTENT_SWITCH
-        self._request_diff()
+        # Already confirmed on the home screen, so the apply step must not ask
+        # again.  This rides on the request, not on a lingering attribute.
+        self._request_diff(INTENT_SWITCH, confirmed=True)
 
     def _set_active_state(self, state_id: str) -> None:
         state = self.config.state(self.active_profile_id(), state_id)
@@ -335,25 +335,28 @@ class App(tk.Tk):
 
     def preview_selected_state(self) -> None:
         if self.selected_state_id():
-            self._intent = INTENT_PREVIEW
-            self._request_diff()
+            self._request_diff(INTENT_PREVIEW)
 
     def apply_selected_state(self) -> None:
         if self.selected_state_id():
-            self._intent = INTENT_SWITCH
-            self._request_diff()
+            self._request_diff(INTENT_SWITCH)
 
     def diff(self) -> None:
         """Advanced screen: preview only, honouring the 'preview only' checkbox."""
-        self._intent = INTENT_PREVIEW
-        self._request_diff()
+        self._request_diff(INTENT_PREVIEW)
 
     def apply(self) -> None:
         """Advanced screen: apply, still guarded by a fresh Diff + digest."""
-        self._intent = INTENT_SWITCH
-        self._request_diff()
+        self._request_diff(INTENT_SWITCH)
 
-    def _request_diff(self) -> None:
+    def _request_diff(self, intent: str, confirmed: bool = False) -> None:
+        """Run a Diff and record what to do with the plan it produces.
+
+        ``confirmed`` is set only when the user has already answered a
+        confirmation for this exact request; both it and the intent are cleared
+        the moment the result is consumed, so a failed or superseded request
+        can never leak a confirmation into the next one.
+        """
         state = self.selected_state_id()
         if not state:
             dialogs.show_message(self, "还没有选择版本", "请先选择一个版本。")
@@ -363,6 +366,8 @@ class App(tk.Tk):
             extras.append("-AllowUnknown")
         if self.advanced.delete_var.get():
             extras.append("-AllowManagedDelete")
+        self._intent = intent
+        self._switch_confirmed = confirmed
         self.call(self._args("Diff", *extras))
 
     def _apply_plan(self, confirmed: bool) -> None:
@@ -786,6 +791,14 @@ class App(tk.Tk):
         self._set_busy(False)
         self._busy = False
 
+        # Consume the request state first, whatever the outcome.  A request
+        # whose reply never arrived in a usable form (a dead backend, a garbled
+        # response) must not leave its intent or its confirmation lying around
+        # for the next result to pick up -- the next apply would then write
+        # files without asking.
+        intent, self._intent = self._intent, INTENT_NONE
+        confirmed, self._switch_confirmed = self._switch_confirmed, False
+
         raw = str(result.get("stdout", "") or "")
         stderr = str(result.get("stderr", "") or "")
         self._append_log(raw + (f"\n[stderr]\n{stderr}" if stderr else "")
@@ -798,7 +811,6 @@ class App(tk.Tk):
             return
 
         action = str(payload.get("action", "")).lower()
-        intent, self._intent = self._intent, INTENT_NONE
 
         if not payload.get("ok"):
             self._fail(payload)
@@ -815,10 +827,9 @@ class App(tk.Tk):
             self.render_diff(data)
             self._last_plan = data
             if intent == INTENT_SWITCH:
-                self._apply_plan(confirmed=self._switch_confirmed)
+                self._apply_plan(confirmed=confirmed)
             else:
                 self.advanced.status("仅预览，未修改文件", "Warn.TLabel")
-            self._switch_confirmed = False
         elif action == "capture":
             self.advanced.capture_info.configure(
                 text=f"已保存 {data.get('fileCount', 0)} 个文件"

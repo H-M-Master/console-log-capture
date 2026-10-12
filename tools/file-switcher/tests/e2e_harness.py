@@ -126,6 +126,22 @@ class E2ETestCase(unittest.TestCase):
         self.assertTrue(result["ok"], f"capture {state} failed: {result}")
         return result
 
+    def apply_state(self, state: str) -> dict:
+        """Apply a version directly, the way the tool would after a confirmation.
+
+        Passes ``-AllowUnknown`` so the move is permitted from any starting
+        content; used by tests that need the target in a known version before
+        the behavior under test can happen.
+        """
+        digest = run_backend(self.config, self.state_root, "-Action", "Diff",
+                             "-ProfileId", "p1", "-StateId", state,
+                             "-AllowUnknown")["data"]["planDigest"]
+        result = run_backend(self.config, self.state_root, "-Action", "Apply",
+                             "-ProfileId", "p1", "-StateId", state,
+                             "-AllowUnknown", "-ExpectedPlanDigest", digest)
+        self.assertTrue(result["ok"], f"apply {state} failed: {result}")
+        return result
+
     # ---------- app ----------
     def make_app(self):
         """The real application, with dialogs answered instead of shown."""

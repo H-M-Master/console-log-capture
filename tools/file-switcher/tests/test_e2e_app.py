@@ -285,6 +285,84 @@ class ScanTests(E2ETestCase):
         self.assertNotIn("two.txt", paths)
 
 
+class ConfirmationLeakTests(E2ETestCase):
+    """A confirmation must apply to one request only, never to the next.
+
+    The home screen confirms before it runs the diff, so the apply step skips
+    its own prompt.  That confirmation has to die with the request it belongs
+    to.  The case that matters is a request whose result never arrives in a
+    usable form: if the flag survived that, the *next* apply would write files
+    without asking, which is the one thing the confirmation exists to prevent.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.make_source("a", {"sub/one.txt": "A"})
+        self.make_source("b", {"sub/one.txt": "B"})
+        self.write_target({"sub/one.txt": "SCRATCH"})
+        self.write_config(["sub\\one.txt"], ["a", "b"])
+        self.capture("a", "a")
+        self.capture("b", "b")
+        # Get the target into a known version so later moves are legitimate.
+        self.apply_state("a")
+
+    def _spoil_next_result(self, app):
+        """Make the very next reply unreadable, then behave normally again.
+
+        Stands in for a backend that died on one request: the request has no
+        usable result, so whatever it had set aside for the follow-up must not
+        survive into the next one.
+        """
+        original = app.runner.run
+
+        def run(args, callback=None):
+            app.runner.run = original          # one-shot
+            app.runner.running = True
+            app.runner.calls.append(list(args))
+            app.runner.running = False
+            (callback or app.runner.callback)({
+                "returncode": 1, "stdout": "backend died", "stderr": "",
+                "duration": 0.0, "command": []})
+
+        app.runner.run = run
+
+    def test_unusable_result_does_not_confirm_the_next_apply(self):
+        from fsx.ui import app as app_module
+
+        app = self.make_app()
+        self._spoil_next_result(app)
+
+        app.switch_to("b", "b")
+        self.pump(app)
+        self.assertTrue(self.errors(), "the unreadable reply should have reported")
+        self.assertFalse(app._switch_confirmed,
+                         "the confirmation must not outlive its request")
+        self.assert_target_is("sub/one.txt", "A")
+
+        # The user did not confirm this next request, so it must ask.
+        app_module.dialogs.confirm.reset_mock()
+        app_module.dialogs.confirm.return_value = False   # user declines
+        app.advanced.dry_var.set(False)                   # will write if allowed
+        app._set_active_state("b")
+        app.apply_selected_state()
+        self.pump(app)
+        self.assertGreaterEqual(app_module.dialogs.confirm.call_count, 1,
+                                "an unconfirmed apply must still ask")
+        self.assert_target_is("sub/one.txt", "A")
+
+    def test_home_switch_confirms_once_then_applies(self):
+        from fsx.ui import app as app_module
+        app = self.make_app()
+        app_module.dialogs.confirm_switch.reset_mock()
+        app_module.dialogs.confirm.reset_mock()
+        app.switch_to("b", "b")
+        self.pump(app)
+        self.assertEqual(app_module.dialogs.confirm_switch.call_count, 1)
+        self.assertEqual(app_module.dialogs.confirm.call_count, 0,
+                         "the home screen already asked")
+        self.assert_target_is("sub/one.txt", "B")
+
+
 class BusyGuardTests(E2ETestCase):
     """A write must not be interruptible, and two must not overlap."""
 
