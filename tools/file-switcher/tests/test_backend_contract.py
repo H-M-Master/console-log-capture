@@ -237,6 +237,19 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(
             self.code(self.ps("Status", config=unsafe)), "path-unsafe-relative")
 
+    def test_capture_rewrites_config_readable_as_plain_utf8(self):
+        # The backend edits the config in place during Capture.  It used to
+        # write a UTF-8 BOM, which the GUI's plain utf-8 reader rejects -- the
+        # tool could not read back the config it had just written.
+        result = self.ps("Capture", "-ProfileId", "p1", "-StateId", "b",
+                         "-SourceRoot", str(self.src_b))
+        self.assertTrue(result["ok"], result)
+        raw = self.config.read_bytes()
+        self.assertNotEqual(raw[:3], b"\xef\xbb\xbf", "config was written with a BOM")
+        data = json.loads(raw.decode("utf-8"))  # must not need utf-8-sig
+        state = next(s for s in data["profiles"][0]["states"] if s["id"] == "b")
+        self.assertTrue(state["snapshotRoot"], state)
+
     def test_state_not_captured_code(self):
         fresh = self.write_config(
             path=self.tmp / "fresh.json",

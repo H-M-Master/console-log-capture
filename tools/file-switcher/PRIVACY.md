@@ -5,8 +5,8 @@
 ## 不会做的事
 
 - 不联网、不上传任何数据、没有遥测或自动更新检查。
-- 不读取、不修改未纳入"受管清单"的文件。
-- 不删除未管理文件、不清空目录。
+- 不读取、不修改你没有勾选管理的文件。
+- 不删除未管理的文件、不清空目录。
 
 ## 数据存放位置
 
@@ -14,10 +14,10 @@
 
 ```text
 %LOCALAPPDATA%\AnyTestTools\FolderSwitcher\
-  folder-config.json     你的方案配置（含目标目录路径）
-  folder-data\snapshots  你采集的状态快照
-  folder-data\transactions 切换事务备份（可回滚）
-  logs\                  操作日志
+  folder-config.json        你的版本设置（含目标文件夹路径）
+  folder-data\snapshots     你保存的版本内容
+  folder-data\transactions  切换时的备份（用于撤销）
+  logs\                     操作日志
 ```
 
 这些目录不会随程序分发，也不会进入 Git 仓库。卸载程序不会自动删除它们；如需彻底清除，手动删除该目录即可。

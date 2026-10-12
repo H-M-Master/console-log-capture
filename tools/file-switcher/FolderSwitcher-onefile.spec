@@ -1,7 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Single-file build of the folder switcher.
-# Bundled payload is unpacked to sys._MEIPASS at launch; all user data
-# (config, snapshots, journals, logs) stays in %LOCALAPPDATA%, never here.
+#
+# The bundled payload is unpacked to sys._MEIPASS at launch; all user data
+# (config, snapshots, journals, logs) goes to %LOCALAPPDATA%\AnyTestTools\
+# FolderSwitcher, never next to the executable.
+#
+# The fsx package must be collected explicitly: it is imported by name inside
+# folder_app.py, and PyInstaller's static analysis does not always follow that
+# through a sys.path manipulation.
 
 import os
 
@@ -16,8 +22,23 @@ a = Analysis(
         ('folder-switcher.ps1', '.'),
         ('profile_store.py', '.'),
         ('templates/folder-config.template.json', 'templates'),
+        ('fsx', 'fsx'),
     ],
-    hiddenimports=[],
+    hiddenimports=[
+        'fsx',
+        'fsx.paths',
+        'fsx.errors',
+        'fsx.backend',
+        'fsx.store',
+        'fsx.model',
+        'fsx.ui',
+        'fsx.ui.app',
+        'fsx.ui.advanced',
+        'fsx.ui.dialogs',
+        'fsx.ui.home',
+        'fsx.ui.theme',
+        'fsx.ui.wizard',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
