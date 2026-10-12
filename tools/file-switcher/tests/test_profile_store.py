@@ -63,6 +63,26 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertEqual(self.store.load()["profiles"][0]["states"], [])
         self.assertTrue(self.config_path.with_name("profiles.json.bak").exists())
 
+    def test_reads_a_config_written_with_a_byte_order_mark(self):
+        """Earlier releases wrote a BOM; those configs must still load.
+
+        The writer stays BOM-free, so this only widens what the reader accepts.
+        """
+        self.store.save(self.data())
+        raw = self.config_path.read_bytes()
+        self.assertNotEqual(raw[:3], b"\xef\xbb\xbf", "writes should stay BOM-free")
+        self.config_path.write_bytes(b"\xef\xbb\xbf" + raw)
+        loaded = self.store.load()
+        self.assertEqual(loaded["profiles"][0]["id"], "main")
+
+    def test_rewriting_a_bom_config_removes_the_mark(self):
+        self.store.save(self.data())
+        raw = self.config_path.read_bytes()
+        self.config_path.write_bytes(b"\xef\xbb\xbf" + raw)
+        loaded = self.store.load()
+        self.store.save(loaded)
+        self.assertNotEqual(self.config_path.read_bytes()[:3], b"\xef\xbb\xbf")
+
     def test_zero_states_are_allowed(self):
         validate_config(self.data(states=[]), self.workspace)
 

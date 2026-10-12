@@ -287,7 +287,10 @@ class ProfileStore:
     def load(self) -> dict[str, Any]:
         raw = self.config_path.read_bytes()
         try:
-            data = json.loads(raw.decode("utf-8"))
+            # utf-8-sig, not utf-8: configs written by earlier releases carry a
+            # byte-order mark.  It decodes plain UTF-8 identically, so this only
+            # widens what we accept.  Writes stay BOM-free (see save()).
+            data = json.loads(raw.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ConfigFormatError(f"配置 JSON 无效：{self.config_path}") from exc
         validate_config(data, self.base, require_targets=True)
@@ -359,7 +362,8 @@ def import_legacy(legacy_path: os.PathLike[str] | str, config_path: os.PathLike[
     source_path = Path(legacy_path).expanduser().resolve(strict=False)
     config_destination = Path(config_path).expanduser().resolve(strict=False)
     try:
-        legacy = json.loads(source_path.read_text(encoding="utf-8"))
+        # utf-8-sig for the same reason as load(): older files may carry a BOM.
+        legacy = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ConfigFormatError(f"无法读取旧配置：{source_path}") from exc
     if not isinstance(legacy, dict) or legacy.get("schemaVersion") != 1:
